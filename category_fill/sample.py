@@ -66,6 +66,16 @@ def make_loans(n: int = 20000, missing_rate: float = 0.15, seed: int = 7) -> pd.
         }
     )
     df["origination_date"] = df["origination_date"].dt.strftime("%m/%d/%Y")
+    # A yes/no flag that maps one-to-one to a sector when set (but is only set on some of those loans).
+    df.insert(
+        len(df.columns) - 1,
+        "farm_program_flag",
+        np.where((df["industry_sector"] == "Agriculture") & (rng.random(n) < 0.6), "Y", "N"),
+    )
+    # A flag that points to a *family* of sectors, not one sector (like a BCC indicator that always means
+    # one of the BCC risk-rating templates, without saying which).
+    family = df["industry_sector"].isin(["Real Estate", "Hospitality", "Construction"])
+    df.insert(len(df.columns) - 1, "cre_secured_flag", np.where(family & (rng.random(n) < 0.7), "Y", "N"))
 
     # Missingness is not perfectly random: Branch J rarely fills the field.
     p_miss = np.where(df["branch"] == "Branch J", missing_rate * 3, missing_rate * 0.8)

@@ -22,6 +22,19 @@ The first run installs dependencies into `.venv` (about a minute). After that, a
 5. **Tab 2 · Features** shows how strongly each column is associated with the target, and flags columns to leave out
    (IDs, constants, no signal, or blank on the same rows as the target). The recommended set is
    pre-selected; edit it as you like.
+   - **Values that limit the category** are found automatically. A value narrows the answer to one
+     category or a *family* of categories, e.g. `bcc_indicator = Y` always means one of the BCC
+     risk-rating templates, without saying which. A value qualifies when it's seen on 20+ labelled
+     loans, 98%+ of them fall in a set of at most half the categories, and the gap is too big to be
+     chance. You can also **add a rule by hand** (column, value, allowed categories).
+   - Each ticked rule makes its column a **must-use feature**. Must-use features can't be dropped by
+     screening, and nearly every tree in the model is allowed to use them. You can also add any other
+     column under "Always include these features".
+   - **Limit predictions to the categories each ticked rule allows** is on by default. A matching loan
+     can only get one of the allowed categories, and the model picks which one. This applies to the
+     test-set readout too, so the accuracy shown is what you get. Tab 3 shows, per rule, how well it
+     holds and how often the model already respects it, plus accuracy with and without the limits.
+     It warns if a rule doesn't hold.
 6. **Tab 3 · Model readout:** press **Train model**. You get:
    - test accuracy compared with a "guess the most common class" baseline, plus top-3 accuracy and macro F1
    - accuracy at each confidence level, and how many blank rows you'd fill at each cut-off
@@ -30,6 +43,13 @@ The first run installs dependencies into `.venv` (about a minute). After that, a
      that finds the smallest set of columns that does the job
 7. **Tab 4 · Filled data:** set a minimum confidence, then download the filled file as CSV, the
    predictions as CSV, or a full Excel report.
+8. **Tab 5 · Explain** draws a decision tree you can show to people, downloadable as PNG, SVG or
+   PDF, plus the same logic as plain IF/THEN rules (.txt).
+   - The real model is hundreds of trees, so this is a single tree trained to give the same answers.
+     **Agreement** shows how faithful the picture is, next to what "always give the most common
+     answer" would score.
+   - Explaining **one category vs. the rest** is typically 90%+ faithful in 3 levels. All categories
+     at once is less faithful (roughly 55–75% on the sample data).
 
 The filled file is your original data plus these columns:
 
@@ -39,6 +59,16 @@ The filled file is your original data plus these columns:
 | `<target>_source` | `original` / `predicted` / `blank (low confidence)` / `excluded` |
 | `<target>_confidence` | model probability for the predicted class (blank rows only) |
 | `<target>_2nd_choice` | runner-up class |
+
+The predictions file has `set_by` (`model`, or `model, changed by rule` where a rule changed the model's pick) and `rules_applied` (the rules matching that row).
+
+**Sessions and refreshes:**
+- A session (uploaded file, settings, trained model) is kept for 24 hours after the browser tab
+  disconnects, for example while the laptop sleeps. This is set in `.streamlit/config.toml`
+  (`disconnectedSessionTTL`).
+- If the page is refreshed, the sidebar offers **Reopen last file**. The app keeps a copy of the
+  last upload in `.category_fill_cache/` on your computer. Untick "Remember this file" to delete it.
+- Re-training with the same settings is instant.
 
 ## Command line
 
@@ -51,6 +81,12 @@ The command prints the full readout and writes `results/filled_data.csv`, `blank
 and `report.xlsx`. Useful flags: `--exclude loan_id borrower_name`, `--categorical branch_no`,
 `--missing-tokens Unknown TBD`, `--min-confidence 0.8`, `--balance-classes`.
 Run `python -m category_fill -h` for all of them.
+
+The CLI also prints any values that limit the category (one category or a family). Useful flags:
+- `--require flag_a flag_b` forces columns into the model.
+- `--apply-value-rules` makes the found rules' columns required and limits predictions to each rule's allowed categories.
+- Every run writes `decision_tree.png/.svg/.pdf` and `decision_tree_rules.txt` (all categories, `--tree-depth`, default 4).
+- It also writes `trees/<category>.png` and `trees/<category>_rules.txt`, one faithful tree per category.
 
 Population rules on the command line (repeat a flag for each column; `|` separates values;
 `a..b` is a numeric range with either end optional; `<blank>` matches empty cells):

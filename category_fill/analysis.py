@@ -174,3 +174,67 @@ def class_distribution(df: pd.DataFrame, target: str) -> pd.DataFrame:
     return pd.DataFrame(
         {"class": counts.index.astype(str), "count": counts.to_numpy(), "pct": (100 * counts / counts.sum()).round(1).to_numpy()}
     )
+
+
+def value_rules(
+    df: pd.DataFrame,
+    target: str,
+    features: list[str],
+    min_rows: int = 20,
+    min_coverage: float = 0.98,
+    max_share_of_classes: float = 0.5,
+    min_expected_outside: float = 5.0,
+    max_levels: int = 50,
+) -> pd.DataFrame:
+    """Find values that limit the target to a small set of classes.
+
+    'Whenever <feature> is <value>, the target is one of <classes>'. A one-to-one rule is the case of a
+    single class. For example, ``bcc_indicator = Y`` might always mean one of the BCC risk-rating
+    templates, without saying which one.
+
+    For each value seen on at least ``min_rows`` labelled loans, the allowed set is the smallest group of
+    classes covering ``min_coverage`` of those loans. It is reported only if:
+      * it is at most ``max_share_of_classes`` of all classes (otherwise it rules out little), and
+      * at least ``min_expected_outside`` loans would have fallen outside the set if the value were
+        unrelated to the target, so the gap is unlikely to be chance.
+    Numeric columns are considered only if they have <= 10 distinct values.
+    """
+    labelled = df.loc[df[target].notna()]
+    y = target_labels(labelled[target]).astype(str)
+    overall = y.value_counts(normalize=True)
+    max_allowed = max(1, int(len(overall) * max_share_of_classes))
+    blank = df.loc[df[target].isna()]
+    rows = []
+    for col in features:
+        s = labelled[col]
+        if col == target or s.nunique() > (max_levels if is_categorical(s) else 10):
+            continue
+        tab = pd.crosstab(s, y)
+        for value, counts in tab.iterrows():
+            n = int(counts.sum())
+            if n < min_rows:
+                continue
+            counts = counts[counts > 0].sort_values(ascending=False)
+            k = int((counts.cumsum() / n < min_coverage).sum()) + 1
+            allowed = sorted(map(str, counts.index[:k]))
+            expected_outside = n * (1 - overall[allowed].sum())
+            if k > max_allowed or expected_outside < min_expected_outside:
+                continue
+            # Always text, so the table never mixes types ("Y" next to 1); matching converts back as needed.
+            shown = str(value)
+            if not is_categorical(s):
+                shown = str(int(value)) if float(value).is_integer() else f"{float(value):g}"
+            rows.append(
+                {
+                    "feature": col,
+                    "value": shown,
+                    "classes": allowed,
+                    "n_classes": k,
+                    "labelled_rows": n,
+                    "coverage": round(float(counts.iloc[:k].sum() / n), 4),
+                    "blank_rows_with_value": int((blank[col] == value).sum()),
+                }
+            )
+    cols = ["feature", "value", "classes", "n_classes", "labelled_rows", "coverage", "blank_rows_with_value"]
+    out = pd.DataFrame(rows, columns=cols)
+    return out.sort_values(["n_classes", "labelled_rows"], ascending=[True, False]).reset_index(drop=True)

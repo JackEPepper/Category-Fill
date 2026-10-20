@@ -34,6 +34,13 @@ class TrainConfig:
     early_stopping_rounds: int = 50
     balance_classes: bool = False  # up-weight rare classes (better recall on them, lower overall accuracy)
     refit_on_all: bool = True  # retrain on every labelled row before filling the blanks
+    # Features that must be in the model, even if screening would drop them. They are also favoured when
+    # trees sample columns (colsample_bytree), so nearly every tree can split on them.
+    required_features: tuple[str, ...] = ()
+    required_feature_weight: float = 10.0
+    # Limit predictions to the classes each value rule allows (see analysis.value_rules), e.g. a loan with
+    # bcc_indicator = Y can only get one of the BCC templates. The model still picks which one.
+    apply_value_rules: bool = False
     random_state: int = 42
     n_jobs: int = -1
 
@@ -88,11 +95,25 @@ class FillResult:
     thresholds: pd.DataFrame
     test_predictions: pd.DataFrame
     predictions: pd.DataFrame
+    rule_check: pd.DataFrame
     model: xgb.XGBClassifier = field(repr=False)
     preprocessor: Preprocessor = field(repr=False)
 
 
-def _make_model(cfg: TrainConfig, n_classes: int, n_estimators: int | None = None, early_stopping: bool = True):
+def _feature_weights(cfg: TrainConfig, columns) -> np.ndarray | None:
+    if not cfg.required_features:
+        return None
+    req = set(cfg.required_features)
+    return np.array([cfg.required_feature_weight if c in req else 1.0 for c in columns])
+
+
+def _make_model(
+    cfg: TrainConfig,
+    n_classes: int,
+    n_estimators: int | None = None,
+    early_stopping: bool = True,
+    feature_weights: np.ndarray | None = None,
+):
     params = dict(
         n_estimators=n_estimators or cfg.n_estimators,
         learning_rate=cfg.learning_rate,
@@ -112,6 +133,8 @@ def _make_model(cfg: TrainConfig, n_classes: int, n_estimators: int | None = Non
         params.update(objective="binary:logistic", eval_metric="logloss")
     if early_stopping:
         params["early_stopping_rounds"] = cfg.early_stopping_rounds
+    if feature_weights is not None:
+        params["feature_weights"] = feature_weights
     return xgb.XGBClassifier(**params)
 
 
@@ -190,6 +213,10 @@ class _Prepared:
 
 
 def _prepare(df: pd.DataFrame, target: str, features: list[str], cfg: TrainConfig) -> _Prepared:
+    missing = [f for f in cfg.required_features if f not in df]
+    if missing:
+        raise ValueError(f"Required feature(s) not in data: {', '.join(missing)}")
+    features = list(features) + [f for f in cfg.required_features if f not in features]
     if target in features:
         features = [f for f in features if f != target]
     if not features:
@@ -232,7 +259,7 @@ def _fit_eval(p: _Prepared, cfg: TrainConfig, columns: list[str] | None = None):
     cols = columns or list(p.X_lab.columns)
     tr, va, te = p.splits["train"], p.splits["val"], p.splits["test"]
     X = p.X_lab[cols]
-    model = _make_model(cfg, len(p.classes))
+    model = _make_model(cfg, len(p.classes), feature_weights=_feature_weights(cfg, cols))
     model.fit(
         X.iloc[tr],
         p.y_lab[tr],
@@ -244,10 +271,79 @@ def _fit_eval(p: _Prepared, cfg: TrainConfig, columns: list[str] | None = None):
     return model, proba
 
 
+def _rule_hits(rows: pd.DataFrame, rules: list[dict]) -> list[np.ndarray]:
+    """For each value rule, a boolean mask of the loans in ``rows`` (cleaned data) that match it.
+
+    Matching uses the data itself, so a rule applies even if its column isn't a model feature.
+    """
+    hits = []
+    for r in rules:
+        if r["feature"] not in rows:
+            hits.append(np.zeros(len(rows), dtype=bool))
+            continue
+        s = rows[r["feature"]]
+        if is_categorical(s):
+            hit = s.astype("string") == str(r["value"])
+        else:
+            hit = s == float(r["value"])
+        hits.append(hit.fillna(False).to_numpy(dtype=bool))
+    return hits
+
+
+def _usable_rules(rules: pd.DataFrame | None, classes: np.ndarray) -> list[dict]:
+    """Rules as dicts with an 'allowed' list restricted to classes the model predicts."""
+    if rules is None or not len(rules):
+        return []
+    known = set(map(str, classes))
+    out = []
+    for r in rules.to_dict("records"):
+        allowed = r.get("classes")
+        if allowed is None or (not isinstance(allowed, (list, tuple, np.ndarray)) and pd.isna(allowed)):
+            allowed = [r["class"]]  # one-to-one rule given as a single 'class'
+        allowed = [str(c) for c in allowed if str(c) in known]
+        if allowed:
+            out.append({**r, "allowed": allowed, "name": f"{r['feature']} = {r['value']}"})
+    return out
+
+
+def _constrain(proba: np.ndarray, hits: list[np.ndarray], rules: list[dict], classes: np.ndarray):
+    """Zero out classes a matching rule doesn't allow and renormalise. Returns (proba, rule names per row).
+
+    A row matching several rules may only get classes allowed by all of them; if they contradict each
+    other the row is left unconstrained.
+    """
+    col = {c: i for i, c in enumerate(map(str, classes))}
+    mask = np.ones(proba.shape, dtype=bool)
+    names = [[] for _ in range(len(proba))]
+    for r, h in zip(rules, hits):
+        allowed = np.zeros(proba.shape[1], dtype=bool)
+        allowed[[col[c] for c in r["allowed"]]] = True
+        rows = np.flatnonzero(h)
+        mask[rows] &= allowed
+        for i in rows:
+            names[i].append(r["name"])
+    conflict = ~mask.any(axis=1)
+    mask[conflict] = True
+    out = proba * mask
+    out = out / out.sum(axis=1, keepdims=True)
+    labels = ["; ".join(n) if n and not c else "" for n, c in zip(names, conflict)]
+    return out, labels
+
+
 def train_and_fill(
-    df: pd.DataFrame, target: str, features: list[str], config: TrainConfig | None = None, progress=None
+    df: pd.DataFrame,
+    target: str,
+    features: list[str],
+    config: TrainConfig | None = None,
+    progress=None,
+    value_rules: pd.DataFrame | None = None,
 ) -> FillResult:
-    """Full pipeline: split -> train with early stopping -> evaluate on held-out test -> fill blanks."""
+    """Full pipeline: split -> train with early stopping -> evaluate on held-out test -> fill blanks.
+
+    ``value_rules`` (from ``analysis.value_rules``) are checked against the model. With
+    ``config.apply_value_rules`` predictions on matching rows (test and blank) are limited to the classes
+    each rule allows, so the readout reflects exactly what gets filled.
+    """
     cfg = config or TrainConfig()
     say = progress or (lambda msg: None)
 
@@ -259,6 +355,12 @@ def train_and_fill(
     say("Training XGBoost (early stopping on validation set)")
     model, proba = _fit_eval(p, cfg)
     best_iter = int(getattr(model, "best_iteration", cfg.n_estimators - 1) or 0) + 1
+    X_test = p.X_lab.iloc[te]
+    rules = _usable_rules(value_rules, p.classes)
+    test_hits = _rule_hits(df.loc[X_test.index], rules) if rules else []
+    raw_pred = proba.argmax(1)
+    if cfg.apply_value_rules and rules:
+        proba, _ = _constrain(proba, test_hits, rules, p.classes)
     pred = proba.argmax(1)
     conf = proba.max(1)
     correct = pred == y_test
@@ -267,6 +369,7 @@ def train_and_fill(
     top3 = (np.argsort(-proba, axis=1)[:, :3] == y_test[:, None]).any(1).mean()
     metrics = {
         "accuracy": accuracy_score(y_test, pred),
+        "accuracy_without_rules": accuracy_score(y_test, raw_pred),
         "baseline_accuracy": float((y_test == majority).mean()),
         "baseline_class": str(p.classes[majority]),
         "macro_f1": f1_score(y_test, pred, average="macro"),
@@ -299,7 +402,6 @@ def train_and_fill(
     confusion.index.name = "actual \\ predicted"
 
     say("Measuring feature importance")
-    X_test = p.X_lab.iloc[te]
     gain = pd.Series(model.get_booster().get_score(importance_type="total_gain"))
     perm = permutation_importance(model, X_test, y_test, seed=cfg.random_state)
     importance = pd.DataFrame(
@@ -326,21 +428,59 @@ def train_and_fill(
     if cfg.refit_on_all and len(p.X_unlab):
         say("Refitting on all labelled rows")
         n_trees = max(1, int(best_iter * 1.1))
-        final_model = _make_model(cfg, len(p.classes), n_estimators=n_trees, early_stopping=False)
+        final_model = _make_model(
+            cfg, len(p.classes), n_estimators=n_trees, early_stopping=False,
+            feature_weights=_feature_weights(cfg, p.X_lab.columns),
+        )
         final_model.fit(p.X_lab, p.y_lab, sample_weight=_weights(p.y_lab, cfg), verbose=False)
 
     say("Predicting blank rows")
+    blank_hits = _rule_hits(df.loc[p.unlab_index], rules) if rules else []
     if len(p.X_unlab):
         unlab_proba = _proba(final_model, p.X_unlab)
+        blank_raw_pred = unlab_proba.argmax(1)
+        set_by = np.full(len(unlab_proba), "model", dtype=object)
+        applied = [""] * len(unlab_proba)
+        if cfg.apply_value_rules and rules:
+            say("Limiting predictions to the categories each rule allows")
+            unlab_proba, applied = _constrain(unlab_proba, blank_hits, rules, p.classes)
+            set_by[unlab_proba.argmax(1) != blank_raw_pred] = "model, changed by rule"
         predictions = _top_k(unlab_proba, p.classes)
         predictions.insert(0, "row", p.unlab_index)
         predictions.insert(1, "predicted", predictions["choice_1"])
         predictions.insert(2, "confidence", predictions["prob_1"])
         predictions = predictions.drop(columns=["choice_1", "prob_1"])
+        predictions.insert(3, "set_by", set_by)
+        predictions.insert(4, "rules_applied", applied)
         unlab_conf = unlab_proba.max(1)
     else:
-        predictions = pd.DataFrame(columns=["row", "predicted", "confidence"])
+        predictions = pd.DataFrame(columns=["row", "predicted", "confidence", "set_by", "rules_applied"])
+        blank_raw_pred = np.array([], dtype=int)
         unlab_conf = np.array([])
+
+    # How well do the rules hold, and does the unconstrained model already respect them?
+    check_rows = []
+    for r, th, bh in zip(rules, test_hits, blank_hits or [np.zeros(0, dtype=bool)] * len(rules)):
+        allowed = set(r["allowed"])
+        in_set = lambda idx: np.isin(p.classes[idx], list(allowed))  # noqa: E731
+        check_rows.append(
+            {
+                "rule": r["name"],
+                "allowed": " | ".join(r["allowed"]),
+                "test_rows": int(th.sum()),
+                "actual_in_allowed": round(float(in_set(y_test[th]).mean()), 3) if th.any() else np.nan,
+                "model_in_allowed_test": round(float(in_set(raw_pred[th]).mean()), 3) if th.any() else np.nan,
+                "blank_rows": int(bh.sum()),
+                "model_in_allowed_blank": round(float(in_set(blank_raw_pred[bh]).mean()), 3) if bh.any() else np.nan,
+            }
+        )
+    rule_check = pd.DataFrame(
+        check_rows,
+        columns=[
+            "rule", "allowed", "test_rows", "actual_in_allowed", "model_in_allowed_test", "blank_rows",
+            "model_in_allowed_blank",
+        ],
+    )
 
     bins, thresholds = confidence_tables(correct, conf, unlab_conf)
     return FillResult(
@@ -357,6 +497,7 @@ def train_and_fill(
         thresholds=thresholds,
         test_predictions=test_predictions,
         predictions=predictions,
+        rule_check=rule_check,
         model=final_model,
         preprocessor=p.pre,
     )

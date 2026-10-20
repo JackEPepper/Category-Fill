@@ -6,3 +6,4 @@ results/
 data/
 *.xlsx
 !sample_data/*.xlsx
+.category_fill_cache/
