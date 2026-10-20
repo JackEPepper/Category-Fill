@@ -174,3 +174,50 @@ def class_distribution(df: pd.DataFrame, target: str) -> pd.DataFrame:
     return pd.DataFrame(
         {"class": counts.index.astype(str), "count": counts.to_numpy(), "pct": (100 * counts / counts.sum()).round(1).to_numpy()}
     )
+
+
+def value_rules(
+    df: pd.DataFrame,
+    target: str,
+    features: list[str],
+    min_rows: int = 10,
+    min_purity: float = 0.97,
+    max_levels: int = 200,
+) -> pd.DataFrame:
+    """Find one-to-one mappings: 'whenever <feature> is <value>, the target is <class>'.
+
+    Typical example: a yes/no flag such as ``is_construction = Y`` that always means one sector.
+    Only values seen on at least ``min_rows`` labelled loans, with at least ``min_purity`` of them in a
+    single class, are returned. Numeric columns are considered only if they have <= 10 distinct values.
+    """
+    labelled = df.loc[df[target].notna()]
+    y = target_labels(labelled[target]).astype(str)
+    rows = []
+    for col in features:
+        s = labelled[col]
+        if col == target or s.nunique() > (max_levels if is_categorical(s) else 10):
+            continue
+        tab = pd.crosstab(s, y)
+        if tab.empty:
+            continue
+        n = tab.sum(axis=1)
+        top = tab.idxmax(axis=1)
+        purity = tab.max(axis=1) / n
+        keep = (n >= min_rows) & (purity >= min_purity)
+        for value in tab.index[keep]:
+            # Always text, so the table never mixes types ("Y" next to 1); matching converts back as needed.
+            shown = str(value)
+            if not is_categorical(s):
+                shown = str(int(value)) if float(value).is_integer() else f"{float(value):g}"
+            rows.append(
+                {
+                    "feature": col,
+                    "value": shown,
+                    "class": top[value],
+                    "labelled_rows": int(n[value]),
+                    "purity": round(float(purity[value]), 4),
+                    "blank_rows_with_value": int((df.loc[df[target].isna(), col] == value).sum()),
+                }
+            )
+    cols = ["feature", "value", "class", "labelled_rows", "purity", "blank_rows_with_value"]
+    return pd.DataFrame(rows, columns=cols).sort_values(["purity", "labelled_rows"], ascending=False).reset_index(drop=True)

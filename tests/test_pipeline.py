@@ -81,6 +81,12 @@ def test_train_and_fill(loans):
     strict = cf.fill_frame(raw, r, min_confidence=0.99)
     assert (strict["industry_sector_source"] == "blank (low confidence)").sum() > 0
 
+    import pyarrow as pa
+    from category_fill.report import summary_frame
+
+    for frame in (summary_frame(r), r.per_class.reset_index(), r.predictions, r.rule_check, filled):
+        pa.Table.from_pandas(frame)  # every table the app shows must be Arrow-compatible
+
     xlsx = cf.report_workbook(r, filled)
     assert pd.ExcelFile(io.BytesIO(xlsx)).sheet_names[0] == "summary"
 
@@ -170,3 +176,45 @@ def test_excel_mixed_type_columns(tmp_path):
     pa.Table.from_pandas(df)  # used to raise ArrowInvalid: could not convert 'ABL - General' ... to int64
     cleaned = cf.clean_frame(df)
     assert cleaned["product"].dtype == "string" and cleaned["product"].isna().sum() == 1
+
+
+def test_value_rules_required_features_and_override():
+    from category_fill.analysis import value_rules
+
+    raw = make_loans(n=4000, seed=3)
+    df = cf.clean_frame(raw)
+    rules = value_rules(df, "industry_sector", [c for c in df.columns if c != "industry_sector"])
+    flag = rules[rules["feature"] == "farm_program_flag"]
+    assert flag[["value", "class"]].values.tolist() == [["Y", "Agriculture"]]
+    assert rules["value"].map(type).eq(str).all()
+
+    cfg = cf.TrainConfig(n_estimators=150, required_features=("farm_program_flag",), apply_value_rules=True)
+    r = cf.train_and_fill(df, "industry_sector", ["collateral_type", "property_type"], cfg, value_rules=flag)
+    assert "farm_program_flag" in r.features
+    assert r.rule_check["model_agrees_on_test"].iloc[0] > 0.95
+    blank_y = df.loc[df["industry_sector"].isna() & (df["farm_program_flag"] == "Y")].index
+    preds = r.predictions.set_index("row").loc[blank_y]
+    assert (preds["predicted"] == "Agriculture").all() and preds["set_by"].str.startswith("rule").all()
+
+    with pytest.raises(ValueError):
+        cf.train_and_fill(df, "industry_sector", ["collateral_type"], cf.TrainConfig(required_features=("nope",)))
+
+
+def test_surrogate_tree_exports(loans):
+    from category_fill import explain
+
+    _, df = loans
+    r = cf.train_and_fill(df, "industry_sector", ["collateral_type", "property_type", "loan_type", "loan_amount"],
+                          cf.TrainConfig(n_estimators=100))
+    s = explain.fit_surrogate(df, r, max_depth=3)
+    assert 0 < s.fidelity <= 1 and s.tree.get_depth() <= 3
+    assert s.tree.tree_.n_node_samples[0] == len(df)  # refit on every loan
+    focused = explain.fit_surrogate(df, r, max_depth=3, focus="Real Estate")
+    assert set(focused.class_names) <= {"Real Estate", explain.OTHER} and focused.fidelity > 0.8
+    fig = explain.tree_figure(focused)
+    texts = [t.get_text() for t in fig.axes[0].texts]
+    assert any(t.startswith("→ ") for t in texts) and {"No", "Yes"} <= {t.strip() for t in texts}
+    assert explain.figure_bytes(fig, "png")[:4] == b"\x89PNG"
+    assert b"<svg" in explain.figure_bytes(fig, "svg")
+    assert explain.figure_bytes(fig, "pdf")[:4] == b"%PDF"
+    assert "THEN" in explain.rules_text(focused) and len(explain.rules_frame(focused)) == focused.tree.get_n_leaves()

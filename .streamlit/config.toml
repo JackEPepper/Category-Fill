@@ -3,6 +3,9 @@ primaryColor = "#2a78d6"
 
 [server]
 maxUploadSize = 500
+# Keep a session (uploaded file, trained model, settings) alive for 24 hours after the browser tab
+# disconnects, e.g. when the laptop sleeps. Streamlit's default is 2 minutes.
+disconnectedSessionTTL = 86400
 
 [browser]
 gatherUsageStats = false

@@ -26,9 +26,12 @@ def summary_frame(result: FillResult) -> pd.DataFrame:
         ("Log loss", round(m["log_loss"], 4)),
         ("Trees (early stopping)", m["trees"]),
         ("Features used", ", ".join(result.features)),
+        ("Must-use features", ", ".join(result.config.required_features) or "none"),
+        ("One-to-one rules forced on blank rows", "yes" if result.config.apply_value_rules else "no"),
         ("Classes too rare to predict", ", ".join(f"{k} ({v})" for k, v in result.dropped_classes.items()) or "none"),
     ]
-    return pd.DataFrame(rows, columns=["metric", "value"])
+    # Values are a mix of numbers and text; keep the column one type so Arrow-based viewers can show it.
+    return pd.DataFrame([(k, str(v)) for k, v in rows], columns=["metric", "value"])
 
 
 def report_workbook(
@@ -48,6 +51,8 @@ def report_workbook(
         "blank_row_predictions": result.predictions,
         "test_set_predictions": result.test_predictions,
     }
+    if len(result.rule_check):
+        sheets["value_rule_check"] = result.rule_check
     if population_rules is not None and len(population_rules):
         sheets["population_rules"] = population_rules
     if associations is not None:

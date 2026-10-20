@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
+from datetime import datetime
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -20,13 +26,43 @@ from category_fill import (
     suggest_targets,
     train_and_fill,
 )
+from category_fill import explain
+from category_fill.analysis import value_rules
 from category_fill.data import is_categorical
 from category_fill.filters import Rule, fmt_num, population_mask, rules_from_json, rules_summary, rules_to_json
 from category_fill.report import summary_frame
 from category_fill.sample import make_loans
 
 BAR = "#2a78d6"
+# Last uploaded file is kept here (on this computer only) so a page refresh or expired session can reopen it.
+CACHE_DIR = Path(__file__).parent / ".category_fill_cache"
 st.set_page_config(page_title="Category Fill", layout="wide")
+
+
+def _last_file() -> tuple[str, bytes, str] | None:
+    try:
+        meta = json.loads((CACHE_DIR / "last.json").read_text())
+        return meta["name"], (CACHE_DIR / "last.bin").read_bytes(), meta["saved"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _remember(upload) -> None:
+    try:
+        meta_path = CACHE_DIR / "last.json"
+        if meta_path.exists() and json.loads(meta_path.read_text()).get("file_id") == upload.file_id:
+            return
+        CACHE_DIR.mkdir(exist_ok=True)
+        (CACHE_DIR / "last.bin").write_bytes(upload.getvalue())
+        saved = datetime.now().strftime("%Y-%m-%d %H:%M")
+        meta_path.write_text(json.dumps({"name": upload.name, "saved": saved, "file_id": upload.file_id}))
+    except OSError:
+        pass
+
+
+def _forget() -> None:
+    for f in ("last.json", "last.bin"):
+        (CACHE_DIR / f).unlink(missing_ok=True)
 
 
 @st.cache_data(show_spinner="Reading file")
@@ -47,6 +83,25 @@ def _clean(raw: pd.DataFrame, tokens: tuple, force_cat: tuple) -> pd.DataFrame:
 @st.cache_data(show_spinner="Screening features")
 def _assoc(df: pd.DataFrame, target: str, cands: tuple) -> pd.DataFrame:
     return feature_associations(df, target, list(cands))
+
+
+@st.cache_data(show_spinner="Looking for one-to-one values")
+def _value_rules(df: pd.DataFrame, target: str, cands: tuple) -> pd.DataFrame:
+    return value_rules(df, target, list(cands))
+
+
+# Results are kept on the server, so re-running the same model after a refresh is instant.
+@st.cache_resource(show_spinner=False, max_entries=6)
+def _train(df: pd.DataFrame, target: str, features: tuple, cfg: TrainConfig, rules: pd.DataFrame):
+    return train_and_fill(df, target, list(features), cfg, value_rules=rules)
+
+
+def _surrogate(df: pd.DataFrame, res, depth: int, focus: str | None):
+    cache = st.session_state.setdefault("surrogates", {})
+    key = (id(res), depth, focus)
+    if key not in cache:
+        cache[key] = explain.fit_surrogate(df, res, max_depth=depth, focus=focus)
+    return cache[key]
 
 
 def hbar(frame: pd.DataFrame, x: str, y: str, title: str, fmt: str = ".2f"):
@@ -176,11 +231,27 @@ def population_editor(frame: pd.DataFrame) -> list[Rule]:
 # ---------------------------------------------------------------- sidebar: data in
 st.sidebar.title("Category Fill")
 upload = st.sidebar.file_uploader("Drop your loan file here", type=["csv", "tsv", "xlsx", "xls", "parquet"])
-use_sample = st.sidebar.toggle("Use synthetic sample data instead", value=upload is None)
+last = _last_file()
+reopen = False
+if upload is not None:
+    if st.sidebar.checkbox(
+        "Remember this file on this computer",
+        value=True,
+        help=f"Keeps a copy in {CACHE_DIR} so a refresh or expired session can reopen it. Untick to delete it.",
+    ):
+        _remember(upload)
+    else:
+        _forget()
+elif last is not None:
+    reopen = st.sidebar.toggle(f"Reopen last file: {last[0]}", value=True, help=f"Saved {last[2]}")
+use_sample = st.sidebar.toggle("Use synthetic sample data instead", value=upload is None and not reopen)
 
 if upload is not None and not use_sample:
     raw = _load(upload.getvalue(), upload.name)
     source_name = upload.name.rsplit(".", 1)[0]
+elif reopen and not use_sample:
+    raw = _load(last[1], last[0])
+    source_name = last[0].rsplit(".", 1)[0]
 elif use_sample:
     raw = _sample()
     source_name = "sample_loans"
@@ -202,8 +273,8 @@ with st.sidebar.expander("Data cleaning options"):
 tokens = tuple(t.strip() for t in tokens.split(",") if t.strip())
 df_all = _clean(raw, tokens, tuple(force_cat))
 
-tab_pop, tab_data, tab_feat, tab_model, tab_pred = st.tabs(
-    ["0 · Population", "1 · Data", "2 · Features", "3 · Model readout", "4 · Filled data"]
+tab_pop, tab_data, tab_feat, tab_model, tab_pred, tab_explain = st.tabs(
+    ["0 · Population", "1 · Data", "2 · Features", "3 · Model readout", "4 · Filled data", "5 · Explain"]
 )
 
 # ---------------------------------------------------------------- 0. population
@@ -239,7 +310,7 @@ with st.sidebar.expander("Model settings"):
     test_size = st.slider("Test set share", 0.1, 0.4, 0.2, 0.05, help="Labelled rows held back to grade the model.")
     min_class = st.number_input("Min rows per class", 2, 500, 10, help="Rarer classes can't be predicted reliably.")
     balance = st.checkbox("Balance classes", help="Better recall on rare classes, usually lower overall accuracy.")
-    depth = st.slider("Tree depth", 2, 12, 6)
+    depth = st.slider("XGBoost tree depth", 2, 12, 6)
     lr = st.select_slider("Learning rate", [0.01, 0.02, 0.05, 0.1, 0.2], value=0.05)
 cfg = TrainConfig(test_size=test_size, min_class_count=int(min_class), balance_classes=balance, max_depth=depth, learning_rate=lr)
 
@@ -301,18 +372,56 @@ with tab_feat:
         default=list(assoc.loc[assoc["recommended"], "feature"]),
     )
 
+    st.subheader("Must-use features and one-to-one values")
+    st.markdown(
+        "Some values decide the category on their own, e.g. a yes/no flag where **Y always means one "
+        "category**. These are found automatically below (a value seen on at least 10 labelled loans, with "
+        "97%+ of them in a single category). Ticked rules make their feature **always included**. "
+        "Must-use features can't be dropped by screening, and nearly every tree in the model is allowed to use them."
+    )
+    found = _value_rules(df, target, candidates)
+    if len(found):
+        edited = st.data_editor(
+            found.assign(use=True),
+            hide_index=True,
+            width="stretch",
+            disabled=[c for c in found.columns],
+            column_config={
+                "use": st.column_config.CheckboxColumn("use", help="Untick to ignore this rule"),
+                "purity": st.column_config.NumberColumn("purity", format="percent"),
+                "value": st.column_config.TextColumn("value"),
+            },
+            key=f"value_rules_{target}",
+        )
+        chosen_rules = edited.loc[edited["use"]].drop(columns="use")
+    else:
+        st.caption("No one-to-one values found in the selected candidate columns.")
+        chosen_rules = found
+    required = st.multiselect(
+        "Always include these features",
+        list(candidates),
+        default=sorted(chosen_rules["feature"].unique()),
+        help="Added to the model even if not selected above, and favoured when trees sample columns.",
+    )
+    apply_rules = st.toggle(
+        "Force the ticked rules onto blank rows",
+        value=False,
+        help="When a blank row has a rule's value, use the rule's category instead of the model's guess. "
+        "The model usually learns these anyway; tab 3 shows whether it agrees with each rule.",
+    )
+    features = list(dict.fromkeys(features + required))
+    cfg = replace(cfg, required_features=tuple(required), apply_value_rules=apply_rules)
+
 # ---------------------------------------------------------------- 3. model
 with tab_model:
     run = st.button("Train model", type="primary", disabled=not features)
     if run:
-        status = st.status("Training", expanded=False)
         try:
-            res = train_and_fill(df, target, features, cfg, progress=status.write)
+            with st.spinner("Training XGBoost and scoring the test set"):
+                res = _train(df, target, tuple(features), cfg, chosen_rules.reset_index(drop=True))
         except ValueError as e:
-            status.update(label="Failed", state="error")
             st.error(str(e))
             st.stop()
-        status.update(label="Done", state="complete")
         st.session_state.update(result=res, curve=None, result_key=(source_name, target, rules_key))
 
     res = st.session_state.get("result")
@@ -334,6 +443,20 @@ with tab_model:
                 "Too rare to predict (below min rows per class): "
                 + ", ".join(f"{k} ({v})" for k, v in res.dropped_classes.items())
             )
+
+        if len(res.rule_check):
+            st.subheader("Does the model follow the one-to-one rules?")
+            st.dataframe(
+                res.rule_check,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "model_agrees_on_test": st.column_config.NumberColumn(format="percent"),
+                    "model_agrees_on_blank": st.column_config.NumberColumn(format="percent"),
+                },
+            )
+            if res.config.apply_value_rules:
+                st.caption("Rules are being forced onto matching blank rows (see the set_by column in tab 4).")
 
         st.subheader("How much to trust each prediction")
         left, right = st.columns(2)
@@ -370,7 +493,7 @@ with tab_model:
 
         cm = res.confusion
         norm = st.toggle("Show confusion matrix as row %", value=True)
-        shown = cm.div(cm.sum(1).replace(0, 1), axis=0) if norm else cm
+        shown = cm.div(cm.sum(axis=1).replace(0, 1), axis=0) if norm else cm
         fig = px.imshow(
             shown,
             text_auto=".0%" if norm else "d",
@@ -446,3 +569,66 @@ with tab_pred:
         )
         with st.expander("Summary"):
             st.dataframe(summary_frame(res), hide_index=True, width="stretch")
+
+# ---------------------------------------------------------------- 5. explain
+with tab_explain:
+    res = st.session_state.get("result")
+    if res is None or st.session_state.get("result_key") != (source_name, target, rules_key):
+        st.info("Train a model first (tab 3).")
+    else:
+        st.markdown(
+            "The model itself is hundreds of small trees, which can't be read. This tab draws **one** decision tree "
+            "trained to give the same answers as the model. **Agreement** shows how often it does, so you know how "
+            "faithful the picture is. A single category against the rest is usually 90%+ faithful in 3 levels. "
+            "All categories at once needs more levels."
+        )
+        c1, c2 = st.columns(2)
+        ALL = "All categories at once (less faithful)"
+        by_size = list(res.per_class.sort_values("train_rows", ascending=False).index)
+        choice = c1.selectbox("Explain", by_size + [ALL], help="One category vs. the rest gives the clearest, most faithful tree.")
+        focus = None if choice == ALL else choice
+        tree_depth = c2.slider("Levels of questions", 2, 6, 4 if focus is None else 3)
+        with st.spinner("Fitting explanation tree"):
+            sur = _surrogate(df, res, tree_depth, focus)
+        m1, m2, m3 = st.columns(3)
+        m1.metric(
+            "Agreement with the model",
+            f"{sur.fidelity:.1%}",
+            f"vs {sur.baseline_fidelity:.1%} by always giving the most common answer",
+            delta_color="off",
+            delta_arrow="off",
+            help="On loans the explanation tree didn't see. The comparison shows how much the questions add.",
+        )
+        m2.metric(
+            "Explanation tree right vs. actual",
+            f"{sur.accuracy:.1%}" if sur.accuracy == sur.accuracy else "n/a",
+            help="Share of labelled loans (not used to build the tree) where the tree's answer matches the real category.",
+        )
+        m3.metric(
+            "Full model accuracy (test set)",
+            f"{res.metrics['accuracy']:.1%}",
+            help="From tab 3. Measured on held-out loans the model never trained on." if focus is None
+            else "From tab 3, across all categories. Measured on held-out loans the model never trained on.",
+        )
+        if sur.fidelity < 0.8:
+            st.warning(
+                "This simplified tree only matches the model on "
+                f"{sur.fidelity:.0%} of loans. Add levels, or explain one category at a time for a more faithful picture."
+            )
+        fig = explain.tree_figure(sur)
+        st.pyplot(fig, width="stretch")
+        stem = f"{source_name}_{target}_tree" + (f"_{focus}" if focus else "") + f"_depth{tree_depth}"
+        stem = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in stem)
+        d1, d2, d3, d4 = st.columns(4)
+        d1.download_button("Download PNG", explain.figure_bytes(fig, "png"), f"{stem}.png", "image/png")
+        d2.download_button("Download SVG", explain.figure_bytes(fig, "svg"), f"{stem}.svg", "image/svg+xml")
+        d3.download_button("Download PDF", explain.figure_bytes(fig, "pdf"), f"{stem}.pdf", "application/pdf")
+        d4.download_button("Download rules (.txt)", explain.rules_text(sur), f"{stem}_rules.txt", "text/plain")
+        plt.close(fig)
+        st.subheader("The same tree as IF/THEN rules")
+        st.dataframe(
+            explain.rules_frame(sur),
+            hide_index=True,
+            width="stretch",
+            column_config={"share": st.column_config.NumberColumn("share of loans in group", format="percent")},
+        )

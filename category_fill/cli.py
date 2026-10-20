@@ -17,6 +17,8 @@ from . import (
     suggest_targets,
     train_and_fill,
 )
+from . import explain
+from .analysis import value_rules
 from .filters import parse_rule_arg, population_mask, rules_from_json, rules_summary
 from .report import summary_frame
 
@@ -45,6 +47,13 @@ def main(argv=None):
         help="keep only loans matching, same syntax as --exclude-rows",
     )
     ap.add_argument("--rules", help="population rules JSON (as saved from the app)")
+    ap.add_argument("--require", nargs="+", default=[], help="features that must be in the model")
+    ap.add_argument(
+        "--apply-value-rules",
+        action="store_true",
+        help="force detected one-to-one values (e.g. flag=Y always means one class) onto blank rows",
+    )
+    ap.add_argument("--tree-depth", type=int, default=4, help="levels in the exported explanation tree")
     ap.add_argument("--min-confidence", type=float, default=0.0, help="leave predictions below this blank")
     ap.add_argument("--test-size", type=float, default=0.2)
     ap.add_argument("--min-class-count", type=int, default=10)
@@ -78,9 +87,21 @@ def main(argv=None):
     if shift["shift"].iloc[0] > 0.1:
         print(f"\nNote: blank rows differ from labelled rows most on: {', '.join(shift.loc[shift['shift'] > 0.1, 'feature'])}")
 
+    rules = value_rules(df, target, candidates)
+    if len(rules):
+        print("\nOne-to-one values found (value -> always this class):\n" + rules.to_string(index=False))
     features = args.features or list(assoc.loc[assoc["recommended"], "feature"])
-    cfg = TrainConfig(test_size=args.test_size, min_class_count=args.min_class_count, balance_classes=args.balance_classes)
-    result = train_and_fill(df, target, features, cfg, progress=lambda m: print(f"... {m}"))
+    required = list(dict.fromkeys(args.require + (list(rules["feature"].unique()) if args.apply_value_rules else [])))
+    cfg = TrainConfig(
+        test_size=args.test_size,
+        min_class_count=args.min_class_count,
+        balance_classes=args.balance_classes,
+        required_features=tuple(required),
+        apply_value_rules=args.apply_value_rules,
+    )
+    result = train_and_fill(df, target, features, cfg, progress=lambda m: print(f"... {m}"), value_rules=rules)
+    if len(result.rule_check):
+        print("\nDoes the model follow them?\n" + result.rule_check.to_string(index=False))
 
     print("\n" + summary_frame(result).to_string(index=False))
     print("\nPer class (test set):\n" + result.per_class.to_string())
@@ -98,7 +119,31 @@ def main(argv=None):
     filled.to_csv(out / "filled_data.csv", index=False)
     result.predictions.to_csv(out / "blank_row_predictions.csv", index=False)
     (out / "report.xlsx").write_bytes(report_workbook(result, filled, assoc, curve, rule_table))
-    print(f"\nWrote {out}/filled_data.csv, blank_row_predictions.csv, report.xlsx")
+
+    import matplotlib.pyplot as plt
+
+    sur = explain.fit_surrogate(df, result, max_depth=args.tree_depth)
+    fig = explain.tree_figure(sur)
+    for fmt in ("png", "svg", "pdf"):
+        (out / f"decision_tree.{fmt}").write_bytes(explain.figure_bytes(fig, fmt))
+    (out / "decision_tree_rules.txt").write_text(explain.rules_text(sur), encoding="utf-8")
+    plt.close(fig)
+    print(f"\nExplanation tree (all categories) agrees with the model on {sur.fidelity:.1%} of held-out loans.")
+
+    # One small, faithful tree per category ("this category vs. the rest").
+    (out / "trees").mkdir(exist_ok=True)
+    for cls in result.classes:
+        one = explain.fit_surrogate(df, result, max_depth=3, focus=cls)
+        fig = explain.tree_figure(one)
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in cls)
+        (out / "trees" / f"{safe}.png").write_bytes(explain.figure_bytes(fig, "png"))
+        (out / "trees" / f"{safe}_rules.txt").write_text(explain.rules_text(one), encoding="utf-8")
+        plt.close(fig)
+        print(f"  {cls}: tree agrees with the model on {one.fidelity:.1%} (always 'other': {one.baseline_fidelity:.1%})")
+    print(
+        f"Wrote {out}/filled_data.csv, blank_row_predictions.csv, report.xlsx, "
+        "decision_tree.png/.svg/.pdf, decision_tree_rules.txt, trees/<category>.png"
+    )
 
 
 if __name__ == "__main__":

@@ -22,6 +22,15 @@ The first run installs dependencies into `.venv` (about a minute). After that, a
 5. **Tab 2 · Features** shows how strongly each column is associated with the target, and flags columns to leave out
    (IDs, constants, no signal, or blank on the same rows as the target). The recommended set is
    pre-selected; edit it as you like.
+   - **One-to-one values** are found automatically. These are values that always mean a single
+     category, such as a yes/no flag where `Y` always means Agriculture. A value qualifies when it
+     appears on 10+ labelled loans and 97%+ of them are in one category.
+   - Each ticked value makes its column a **must-use feature**. Must-use features can't be dropped
+     by screening, and nearly every tree in the model is allowed to use them. You can also add any
+     other column under "Always include these features".
+   - **Force the ticked rules onto blank rows** is optional. With it on, blank rows that carry the
+     value get the rule's category directly. Tab 3 shows how often the model already agrees with
+     each rule.
 6. **Tab 3 · Model readout:** press **Train model**. You get:
    - test accuracy compared with a "guess the most common class" baseline, plus top-3 accuracy and macro F1
    - accuracy at each confidence level, and how many blank rows you'd fill at each cut-off
@@ -30,6 +39,13 @@ The first run installs dependencies into `.venv` (about a minute). After that, a
      that finds the smallest set of columns that does the job
 7. **Tab 4 · Filled data:** set a minimum confidence, then download the filled file as CSV, the
    predictions as CSV, or a full Excel report.
+8. **Tab 5 · Explain** draws a decision tree you can show to people, downloadable as PNG, SVG or
+   PDF, plus the same logic as plain IF/THEN rules (.txt).
+   - The real model is hundreds of trees, so this is a single tree trained to give the same answers.
+     **Agreement** shows how faithful the picture is, next to what "always give the most common
+     answer" would score.
+   - Explaining **one category vs. the rest** is typically 90%+ faithful in 3 levels. All categories
+     at once is less faithful (roughly 55–75% on the sample data).
 
 The filled file is your original data plus these columns:
 
@@ -39,6 +55,16 @@ The filled file is your original data plus these columns:
 | `<target>_source` | `original` / `predicted` / `blank (low confidence)` / `excluded` |
 | `<target>_confidence` | model probability for the predicted class (blank rows only) |
 | `<target>_2nd_choice` | runner-up class |
+
+The predictions file has a `set_by` column: `model`, or the one-to-one rule that set the value.
+
+**Sessions and refreshes:**
+- A session (uploaded file, settings, trained model) is kept for 24 hours after the browser tab
+  disconnects, for example while the laptop sleeps. This is set in `.streamlit/config.toml`
+  (`disconnectedSessionTTL`).
+- If the page is refreshed, the sidebar offers **Reopen last file**. The app keeps a copy of the
+  last upload in `.category_fill_cache/` on your computer. Untick "Remember this file" to delete it.
+- Re-training with the same settings is instant.
 
 ## Command line
 
@@ -51,6 +77,12 @@ The command prints the full readout and writes `results/filled_data.csv`, `blank
 and `report.xlsx`. Useful flags: `--exclude loan_id borrower_name`, `--categorical branch_no`,
 `--missing-tokens Unknown TBD`, `--min-confidence 0.8`, `--balance-classes`.
 Run `python -m category_fill -h` for all of them.
+
+The CLI also prints any one-to-one values it finds. Useful flags:
+- `--require flag_a flag_b` forces columns into the model.
+- `--apply-value-rules` makes the found rules' columns required and forces the rules onto blank rows.
+- Every run writes `decision_tree.png/.svg/.pdf` and `decision_tree_rules.txt` (all categories, `--tree-depth`, default 4).
+- It also writes `trees/<category>.png` and `trees/<category>_rules.txt`, one faithful tree per category.
 
 Population rules on the command line (repeat a flag for each column; `|` separates values;
 `a..b` is a numeric range with either end optional; `<blank>` matches empty cells):
