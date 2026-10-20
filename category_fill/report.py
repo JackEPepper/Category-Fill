@@ -36,6 +36,7 @@ def report_workbook(
     filled: pd.DataFrame | None = None,
     associations: pd.DataFrame | None = None,
     subset_curve: pd.DataFrame | None = None,
+    population_rules: pd.DataFrame | None = None,
 ) -> bytes:
     sheets = {
         "summary": summary_frame(result),
@@ -47,6 +48,8 @@ def report_workbook(
         "blank_row_predictions": result.predictions,
         "test_set_predictions": result.test_predictions,
     }
+    if population_rules is not None and len(population_rules):
+        sheets["population_rules"] = population_rules
     if associations is not None:
         sheets["feature_screening"] = associations
     if subset_curve is not None:

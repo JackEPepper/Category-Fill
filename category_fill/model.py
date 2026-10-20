@@ -391,11 +391,15 @@ def feature_subset_curve(
     return pd.DataFrame(rows)
 
 
-def fill_frame(original: pd.DataFrame, result: FillResult, min_confidence: float = 0.0) -> pd.DataFrame:
+def fill_frame(
+    original: pd.DataFrame, result: FillResult, min_confidence: float = 0.0, in_population: pd.Series | None = None
+) -> pd.DataFrame:
     """Return the original data with the target filled in, plus provenance columns.
 
     ``original`` must share its index with the frame the model was trained on.
     Rows below ``min_confidence`` are left blank and marked 'blank (low confidence)'.
+    Rows where ``in_population`` is False were excluded by population rules: they keep their original
+    value and are marked 'excluded'.
     """
     out = original.copy()
     t = result.target
@@ -413,4 +417,6 @@ def fill_frame(original: pd.DataFrame, result: FillResult, min_confidence: float
         out[f"{t}_confidence"] = pred["confidence"].reindex(out.index)
         if "choice_2" in pred:
             out[f"{t}_2nd_choice"] = pred["choice_2"].reindex(out.index)
+    if in_population is not None:
+        out.loc[~in_population.reindex(out.index, fill_value=True).to_numpy(dtype=bool), f"{t}_source"] = "excluded"
     return out

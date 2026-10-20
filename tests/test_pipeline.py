@@ -109,3 +109,41 @@ def test_subset_curve(loans):
         df, "industry_sector", ["loan_type", "collateral_type", "state"], cf.TrainConfig(n_estimators=100), sizes=[1, 2]
     )
     assert curve["n_features"].tolist() == [1, 2, 3]
+
+
+def test_population_rules(loans):
+    raw, df = loans
+    rules = [
+        cf.Rule("loan_type", ["Line of Credit", "SBA 7(a)"]),
+        cf.Rule("state", ["TX", "CA"], mode="keep"),
+        cf.Rule("loan_amount", min=None, max=100000),
+        cf.Rule("branch"),  # empty rule: ignored
+    ]
+    keep = cf.population_mask(df, rules)
+    kept = df[keep]
+    assert not kept["loan_type"].isin(["Line of Credit", "SBA 7(a)"]).any()
+    assert kept["state"].isin(["TX", "CA"]).all()
+    assert (kept["loan_amount"] > 100000).all()
+    summary = cf.rules_summary(df, rules)
+    assert len(summary) == 3 and summary["remaining"].iloc[-1] == keep.sum()
+    assert cf.rules_from_json(cf.rules_to_json(rules)) == rules
+
+    r = cf.train_and_fill(kept, "industry_sector", ["collateral_type", "property_type"], cf.TrainConfig(n_estimators=50))
+    assert set(r.predictions["row"]) <= set(kept.index)
+    filled = cf.fill_frame(raw, r, in_population=keep)
+    assert (filled.loc[~keep, "industry_sector_source"] == "excluded").all()
+    assert filled.loc[~keep, "industry_sector_filled"].equals(raw.loc[~keep, "industry_sector"].astype(object))
+
+
+def test_rule_blank_numeric_values_and_cli_parse():
+    from category_fill.filters import parse_rule_arg
+
+    df = pd.DataFrame({"x": pd.Series(["a", None, "b"], dtype="string"), "n": [1.0, 2.0, 3.0]})
+    assert cf.population_mask(df, [cf.Rule("x", blank=True)]).tolist() == [True, False, True]
+    assert cf.population_mask(df, [cf.Rule("n", ["2"])]).tolist() == [True, False, True]
+    r = parse_rule_arg("loan_amount=1000..|<blank>|", "keep")
+    assert (r.column, r.min, r.max, r.blank, r.mode) == ("loan_amount", 1000.0, None, True, "keep")
+    r = parse_rule_arg("loan_type=SBA 7(a)|Term Loan", "exclude")
+    assert r.values == ["SBA 7(a)", "Term Loan"]
+    with pytest.raises(ValueError):
+        cf.population_mask(df, [cf.Rule("nope", ["a"])])

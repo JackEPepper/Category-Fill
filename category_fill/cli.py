@@ -17,6 +17,7 @@ from . import (
     suggest_targets,
     train_and_fill,
 )
+from .filters import parse_rule_arg, population_mask, rules_from_json, rules_summary
 from .report import summary_frame
 
 
@@ -28,6 +29,22 @@ def main(argv=None):
     ap.add_argument("--exclude", nargs="+", default=[], help="columns to never use as features")
     ap.add_argument("--categorical", nargs="+", default=[], help="numeric-looking columns to treat as categories")
     ap.add_argument("--missing-tokens", nargs="+", default=[], help="extra values meaning blank, e.g. Unknown")
+    ap.add_argument(
+        "--exclude-rows",
+        action="append",
+        default=[],
+        metavar="COL=VALUES",
+        help="drop loans from the population, e.g. 'loan_type=SBA 7(a)|Line of Credit', 'state=<blank>', "
+        "'loan_amount=..50000'. Repeat for more columns.",
+    )
+    ap.add_argument(
+        "--keep-rows",
+        action="append",
+        default=[],
+        metavar="COL=VALUES",
+        help="keep only loans matching, same syntax as --exclude-rows",
+    )
+    ap.add_argument("--rules", help="population rules JSON (as saved from the app)")
     ap.add_argument("--min-confidence", type=float, default=0.0, help="leave predictions below this blank")
     ap.add_argument("--test-size", type=float, default=0.2)
     ap.add_argument("--min-class-count", type=int, default=10)
@@ -38,6 +55,16 @@ def main(argv=None):
 
     raw = load_table(args.data)
     df = clean_frame(raw, extra_missing_tokens=args.missing_tokens, force_categorical=args.categorical)
+    rules = rules_from_json(Path(args.rules).read_text()) if args.rules else []
+    rules += [parse_rule_arg(r, "exclude") for r in args.exclude_rows]
+    rules += [parse_rule_arg(r, "keep") for r in args.keep_rows]
+    in_pop = population_mask(df, rules)
+    rule_table = rules_summary(df, rules)
+    if rules:
+        print("Population rules:\n" + rule_table.to_string(index=False))
+        print(f"Population: {int(in_pop.sum())} of {len(df)} loans\n")
+    df = df.loc[in_pop]
+
     target = args.target or next(iter(suggest_targets(df)), None)
     if not target or target not in df:
         ap.error(f"could not find target column; pass --target. Columns: {list(df.columns)}")
@@ -67,10 +94,10 @@ def main(argv=None):
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    filled = fill_frame(raw, result, args.min_confidence)
+    filled = fill_frame(raw, result, args.min_confidence, in_population=in_pop)
     filled.to_csv(out / "filled_data.csv", index=False)
     result.predictions.to_csv(out / "blank_row_predictions.csv", index=False)
-    (out / "report.xlsx").write_bytes(report_workbook(result, filled, assoc, curve))
+    (out / "report.xlsx").write_bytes(report_workbook(result, filled, assoc, curve, rule_table))
     print(f"\nWrote {out}/filled_data.csv, blank_row_predictions.csv, report.xlsx")
 
 
