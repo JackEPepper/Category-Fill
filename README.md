@@ -11,18 +11,24 @@ The first run installs dependencies into `.venv` (about a minute). After that, a
 
 1. **Drop your file** (CSV, Excel or Parquet) into the sidebar. A synthetic 20k-loan sample loads
    if you haven't dropped a file yet.
-2. **Column to fill** is picked for you: the category column whose missing share is closest to 15%. Change it if it's wrong.
-3. **Tab 1 · Data** shows each column's type, how much is blank, how many distinct values it has, and the target's class mix.
-4. **Tab 2 · Features** shows how strongly each column is associated with the target, and flags columns to leave out
+2. **Tab 0 · Population** (optional): take loans out of the analysis with rules. Each rule picks one
+   column and either **excludes** the loans holding the values you choose, or **keeps only** those loans.
+   For numeric columns, a rule takes a range instead, and any rule can also match blanks. Stack one
+   rule per column (loan type, state, amount range…). A loan stays in only if it passes every rule.
+   Excluded loans aren't used for training and aren't filled. They stay in the download marked
+   `excluded`. **Save these rules** downloads a `.json` you can load next time, or pass to the CLI.
+3. **Column to fill** is picked for you: the category column whose missing share is closest to 15%. Change it if it's wrong.
+4. **Tab 1 · Data** shows each column's type, how much is blank, how many distinct values it has, and the target's class mix.
+5. **Tab 2 · Features** shows how strongly each column is associated with the target, and flags columns to leave out
    (IDs, constants, no signal, or blank on the same rows as the target). The recommended set is
    pre-selected; edit it as you like.
-5. **Tab 3 · Model readout:** press **Train model**. You get:
+6. **Tab 3 · Model readout:** press **Train model**. You get:
    - test accuracy compared with a "guess the most common class" baseline, plus top-3 accuracy and macro F1
    - accuracy at each confidence level, and how many blank rows you'd fill at each cut-off
    - precision, recall and F1 for each category, and a confusion matrix
    - which columns matter (the accuracy lost when each column is shuffled), plus an optional test
      that finds the smallest set of columns that does the job
-6. **Tab 4 · Filled data:** set a minimum confidence, then download the filled file as CSV, the
+7. **Tab 4 · Filled data:** set a minimum confidence, then download the filled file as CSV, the
    predictions as CSV, or a full Excel report.
 
 The filled file is your original data plus these columns:
@@ -30,7 +36,7 @@ The filled file is your original data plus these columns:
 | column | meaning |
 |---|---|
 | `<target>_filled` | original value, or the prediction for blank rows |
-| `<target>_source` | `original` / `predicted` / `blank (low confidence)` |
+| `<target>_source` | `original` / `predicted` / `blank (low confidence)` / `excluded` |
 | `<target>_confidence` | model probability for the predicted class (blank rows only) |
 | `<target>_2nd_choice` | runner-up class |
 
@@ -45,6 +51,18 @@ The command prints the full readout and writes `results/filled_data.csv`, `blank
 and `report.xlsx`. Useful flags: `--exclude loan_id borrower_name`, `--categorical branch_no`,
 `--missing-tokens Unknown TBD`, `--min-confidence 0.8`, `--balance-classes`.
 Run `python -m category_fill -h` for all of them.
+
+Population rules on the command line (repeat a flag for each column; `|` separates values;
+`a..b` is a numeric range with either end optional; `<blank>` matches empty cells):
+
+```bash
+python -m category_fill loans.xlsx --target industry_sector \
+  --exclude-rows "loan_type=SBA 7(a)|Line of Credit" \
+  --exclude-rows "loan_amount=..250000" \
+  --keep-rows "state=TX|CA|FL"
+# or reuse rules saved from the app:
+python -m category_fill loans.xlsx --rules population_rules.json
+```
 
 ## How it works
 

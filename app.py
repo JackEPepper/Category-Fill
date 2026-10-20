@@ -20,6 +20,8 @@ from category_fill import (
     suggest_targets,
     train_and_fill,
 )
+from category_fill.data import is_categorical
+from category_fill.filters import Rule, fmt_num, population_mask, rules_from_json, rules_summary, rules_to_json
 from category_fill.report import summary_frame
 from category_fill.sample import make_loans
 
@@ -60,6 +62,117 @@ def hbar(frame: pd.DataFrame, x: str, y: str, title: str, fmt: str = ".2f"):
     return fig
 
 
+def _new_rule(rule: Rule | None = None) -> None:
+    """Register a rule id; when loading a saved rule, pre-seed its widget state."""
+    ss = st.session_state
+    rid = ss.next_rule
+    ss.next_rule += 1
+    ss.rule_ids.append(rid)
+    if rule is not None:
+        ss[f"r{rid}_mode"] = "Exclude" if rule.mode == "exclude" else "Keep only"
+        ss[f"r{rid}_col"] = rule.column
+        ss[f"r{rid}_vals_{rule.column}"] = list(rule.values)
+        ss[f"r{rid}_min_{rule.column}"] = rule.min
+        ss[f"r{rid}_max_{rule.column}"] = rule.max
+        ss[f"r{rid}_blank_{rule.column}"] = rule.blank
+
+
+def population_editor(frame: pd.DataFrame) -> list[Rule]:
+    ss = st.session_state
+    ss.setdefault("rule_ids", [])
+    ss.setdefault("next_rule", 0)
+    columns = list(frame.columns)
+
+    st.markdown(
+        "Take loans out of the analysis before anything else runs. Each rule looks at **one column**. "
+        "**Exclude** drops the loans it matches, and **Keep only** drops the loans it doesn't match. "
+        "Add one rule per column, and a loan stays in only if it passes every rule. Excluded loans are "
+        "not used for training and are not filled. They stay in the download, marked `excluded`."
+    )
+
+    saved = st.file_uploader("Load saved rules (.json)", type="json", key="rules_upload")
+    if saved is not None and ss.get("rules_loaded") != saved.file_id:
+        try:
+            loaded = rules_from_json(saved.getvalue().decode())
+        except (ValueError, TypeError) as e:
+            st.error(f"Couldn't read rules file: {e}")
+        else:
+            missing = [r.column for r in loaded if r.column not in columns]
+            if missing:
+                st.warning("Skipped rules for columns not in this file: " + ", ".join(missing))
+            ss.rule_ids = []
+            for r in loaded:
+                if r.column in columns:
+                    _new_rule(r)
+        ss.rules_loaded = saved.file_id
+
+    rules = []
+    for rid in list(ss.rule_ids):
+        with st.container(border=True):
+            c_mode, c_col, c_del = st.columns([2, 3, 1], vertical_alignment="bottom")
+            mode = c_mode.radio("Action", ["Exclude", "Keep only"], key=f"r{rid}_mode", horizontal=True)
+            ckey = f"r{rid}_col"
+            col = c_col.selectbox(
+                "Column", columns, key=ckey, placeholder="Pick a column", **({} if ckey in ss else {"index": None})
+            )
+            if c_del.button("Remove", key=f"r{rid}_del"):
+                ss.rule_ids.remove(rid)
+                st.rerun()
+            if col is None:
+                continue
+
+            s = frame[col]
+            values, lo, hi = [], None, None
+            if is_categorical(s) or s.nunique() <= 30:
+                counts = s.value_counts()
+                options = list(counts.index[:2000])
+                vkey = f"r{rid}_vals_{col}"
+                if vkey in ss:  # map saved values onto this file's options, dropping ones that don't exist
+                    by_text = {str(o): o for o in options}
+                    ss[vkey] = [by_text[str(v)] for v in ss[vkey] if str(v) in by_text]
+                values = st.multiselect(
+                    f"Values of {col}" + (" (top 2,000 shown)" if len(counts) > 2000 else ""),
+                    options,
+                    key=vkey,
+                    format_func=lambda v, c=counts: f"{v:g}  ({c[v]:,})" if isinstance(v, float) else f"{v}  ({c[v]:,})",
+                )
+            else:
+                c_lo, c_hi = st.columns(2)
+                kmin, kmax = f"r{rid}_min_{col}", f"r{rid}_max_{col}"
+                lo = c_lo.number_input(f"{col} from", key=kmin, **({} if kmin in ss else {"value": None}))
+                hi = c_hi.number_input(f"{col} to", key=kmax, **({} if kmax in ss else {"value": None}))
+                st.caption(f"Range in data: {fmt_num(s.min())} to {fmt_num(s.max())}. Leave an end empty for no limit.")
+            blank = st.checkbox(f"Match loans where {col} is blank ({int(s.isna().sum()):,})", key=f"r{rid}_blank_{col}")
+
+            rule = Rule(
+                column=col,
+                values=[v.item() if hasattr(v, "item") else v for v in values],
+                min=lo,
+                max=hi,
+                blank=blank,
+                mode="exclude" if mode == "Exclude" else "keep",
+            )
+            rules.append(rule)
+            if rule.is_empty:
+                st.caption("No criteria yet, so this rule has no effect.")
+            else:
+                st.caption(f"{rule.describe()}. Matches {int(rule.matches(frame).sum()):,} loans.")
+
+    if st.button("+ Add rule"):
+        _new_rule()
+        st.rerun()
+
+    active = [r for r in rules if not r.is_empty]
+    if active:
+        keep = population_mask(frame, active)
+        c1, c2 = st.columns(2)
+        c1.metric("Loans in population", f"{int(keep.sum()):,}", f"of {len(frame):,}", delta_color="off", delta_arrow="off")
+        c2.metric("Loans excluded", f"{int((~keep).sum()):,}")
+        st.dataframe(rules_summary(frame, active), hide_index=True, width="stretch")
+        st.download_button("Save these rules (.json)", rules_to_json(active), "population_rules.json", "application/json")
+    return active
+
+
 # ---------------------------------------------------------------- sidebar: data in
 st.sidebar.title("Category Fill")
 upload = st.sidebar.file_uploader("Drop your loan file here", type=["csv", "tsv", "xlsx", "xls", "parquet"])
@@ -87,7 +200,25 @@ with st.sidebar.expander("Data cleaning options"):
         help="E.g. branch numbers or product codes where 12 isn't 'bigger' than 11.",
     )
 tokens = tuple(t.strip() for t in tokens.split(",") if t.strip())
-df = _clean(raw, tokens, tuple(force_cat))
+df_all = _clean(raw, tokens, tuple(force_cat))
+
+tab_pop, tab_data, tab_feat, tab_model, tab_pred = st.tabs(
+    ["0 · Population", "1 · Data", "2 · Features", "3 · Model readout", "4 · Filled data"]
+)
+
+# ---------------------------------------------------------------- 0. population
+with tab_pop:
+    rules = population_editor(df_all)
+in_pop = population_mask(df_all, rules)
+df = df_all.loc[in_pop]
+rules_key = rules_to_json(rules)
+st.sidebar.metric(
+    "Loans in population", f"{len(df):,}", f"{len(df_all) - len(df):,} excluded" if rules else "no exclusions",
+    delta_color="off", delta_arrow="off",
+)
+if df.empty:
+    st.error("Your population rules exclude every loan. Loosen them in tab 0.")
+    st.stop()
 
 suggested = suggest_targets(df)
 options = list(df.columns)
@@ -111,8 +242,6 @@ with st.sidebar.expander("Model settings"):
     depth = st.slider("Tree depth", 2, 12, 6)
     lr = st.select_slider("Learning rate", [0.01, 0.02, 0.05, 0.1, 0.2], value=0.05)
 cfg = TrainConfig(test_size=test_size, min_class_count=int(min_class), balance_classes=balance, max_depth=depth, learning_rate=lr)
-
-tab_data, tab_feat, tab_model, tab_pred = st.tabs(["1 · Data", "2 · Features", "3 · Model readout", "4 · Filled data"])
 
 # ---------------------------------------------------------------- 1. data
 with tab_data:
@@ -184,10 +313,10 @@ with tab_model:
             st.error(str(e))
             st.stop()
         status.update(label="Done", state="complete")
-        st.session_state.update(result=res, curve=None, result_key=(source_name, target))
+        st.session_state.update(result=res, curve=None, result_key=(source_name, target, rules_key))
 
     res = st.session_state.get("result")
-    if res is None or st.session_state.get("result_key") != (source_name, target):
+    if res is None or st.session_state.get("result_key") != (source_name, target, rules_key):
         st.info("Pick features in tab 2, then press **Train model**.")
     else:
         m = res.metrics
@@ -281,7 +410,7 @@ with tab_model:
 # ---------------------------------------------------------------- 4. predictions
 with tab_pred:
     res = st.session_state.get("result")
-    if res is None or st.session_state.get("result_key") != (source_name, target):
+    if res is None or st.session_state.get("result_key") != (source_name, target, rules_key):
         st.info("Train a model first (tab 3).")
     else:
         min_conf = st.slider(
@@ -289,7 +418,7 @@ with tab_pred:
             0.0, 0.99, 0.0, 0.05,
             help="Rows below the cut-off stay blank and are marked 'blank (low confidence)'.",
         )
-        filled = fill_frame(raw, res, min_conf)
+        filled = fill_frame(raw, res, min_conf, in_population=in_pop)
         accepted = int((filled[f"{target}_source"] == "predicted").sum())
         st.metric("Rows filled", f"{accepted:,} of {len(res.predictions):,}")
 
@@ -312,7 +441,7 @@ with tab_pred:
         )
         c3.download_button(
             "Download full report (Excel)",
-            report_workbook(res, filled, assoc, st.session_state.get("curve")),
+            report_workbook(res, filled, assoc, st.session_state.get("curve"), rules_summary(df_all, rules)),
             f"{source_name}_report.xlsx",
         )
         with st.expander("Summary"):
