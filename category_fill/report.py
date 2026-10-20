@@ -27,7 +27,8 @@ def summary_frame(result: FillResult) -> pd.DataFrame:
         ("Trees (early stopping)", m["trees"]),
         ("Features used", ", ".join(result.features)),
         ("Must-use features", ", ".join(result.config.required_features) or "none"),
-        ("One-to-one rules forced on blank rows", "yes" if result.config.apply_value_rules else "no"),
+        ("Predictions limited by value rules", "yes" if result.config.apply_value_rules else "no"),
+        ("Test accuracy without rule limits", round(result.metrics.get("accuracy_without_rules", float("nan")), 4)),
         ("Classes too rare to predict", ", ".join(f"{k} ({v})" for k, v in result.dropped_classes.items()) or "none"),
     ]
     # Values are a mix of numbers and text; keep the column one type so Arrow-based viewers can show it.

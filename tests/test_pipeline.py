@@ -178,26 +178,55 @@ def test_excel_mixed_type_columns(tmp_path):
     assert cleaned["product"].dtype == "string" and cleaned["product"].isna().sum() == 1
 
 
-def test_value_rules_required_features_and_override():
+def test_value_rules_required_features_and_limits():
     from category_fill.analysis import value_rules
 
     raw = make_loans(n=4000, seed=3)
     df = cf.clean_frame(raw)
     rules = value_rules(df, "industry_sector", [c for c in df.columns if c != "industry_sector"])
-    flag = rules[rules["feature"] == "farm_program_flag"]
-    assert flag[["value", "class"]].values.tolist() == [["Y", "Agriculture"]]
+    by_name = {(r.feature, r.value): r.classes for r in rules.itertuples()}
+    assert by_name[("farm_program_flag", "Y")] == ["Agriculture"]  # one-to-one
+    assert by_name[("cre_secured_flag", "Y")] == ["Construction", "Hospitality", "Real Estate"]  # a family
+    assert ("cre_secured_flag", "N") not in by_name  # rules out too little to be useful
     assert rules["value"].map(type).eq(str).all()
 
-    cfg = cf.TrainConfig(n_estimators=150, required_features=("farm_program_flag",), apply_value_rules=True)
-    r = cf.train_and_fill(df, "industry_sector", ["collateral_type", "property_type"], cfg, value_rules=flag)
-    assert "farm_program_flag" in r.features
-    assert r.rule_check["model_agrees_on_test"].iloc[0] > 0.95
-    blank_y = df.loc[df["industry_sector"].isna() & (df["farm_program_flag"] == "Y")].index
-    preds = r.predictions.set_index("row").loc[blank_y]
-    assert (preds["predicted"] == "Agriculture").all() and preds["set_by"].str.startswith("rule").all()
+    family = rules[rules["feature"].isin(["cre_secured_flag", "farm_program_flag"])]
+    cfg = cf.TrainConfig(n_estimators=150, required_features=("cre_secured_flag",), apply_value_rules=True)
+    # Deliberately weak features so the model alone would stray outside the family.
+    r = cf.train_and_fill(df, "industry_sector", ["state", "borrower_entity"], cfg, value_rules=family)
+    assert "cre_secured_flag" in r.features
+    assert (r.rule_check["actual_in_allowed"] > 0.97).all()
+    allowed = {"Construction", "Hospitality", "Real Estate"}
+    flagged = df.loc[df["industry_sector"].isna() & (df["cre_secured_flag"] == "Y")].index
+    preds = r.predictions.set_index("row").loc[flagged]
+    assert preds["predicted"].isin(allowed).all()
+    assert preds["rules_applied"].str.contains("cre_secured_flag = Y").all()
+    assert set(preds["set_by"]) <= {"model", "model, changed by rule"}
+    tp = r.test_predictions
+    assert "accuracy_without_rules" in r.metrics and r.metrics["accuracy"] >= r.metrics["accuracy_without_rules"] - 0.01
+
+    unlimited = cf.train_and_fill(df, "industry_sector", ["state", "borrower_entity"],
+                                  cf.TrainConfig(n_estimators=150), value_rules=family)
+    assert unlimited.metrics["accuracy"] == unlimited.metrics["accuracy_without_rules"]
+    assert (unlimited.predictions["set_by"] == "model").all()
+    assert len(tp) == r.metrics["n_test"]
 
     with pytest.raises(ValueError):
         cf.train_and_fill(df, "industry_sector", ["collateral_type"], cf.TrainConfig(required_features=("nope",)))
+
+
+def test_constrain_intersects_and_handles_conflicts():
+    from category_fill.model import _constrain
+
+    classes = np.array(["A", "B", "C"])
+    proba = np.array([[0.6, 0.3, 0.1], [0.6, 0.3, 0.1], [0.6, 0.3, 0.1]])
+    rules = [{"allowed": ["B", "C"], "name": "f = 1"}, {"allowed": ["C"], "name": "g = 1"}, {"allowed": ["A"], "name": "h = 1"}]
+    hits = [np.array([1, 1, 0], bool), np.array([0, 1, 1], bool), np.array([0, 0, 1], bool)]
+    out, labels = _constrain(proba, hits, rules, classes)
+    assert out[0].round(3).tolist() == [0.0, 0.75, 0.25]  # only B or C, renormalised
+    assert out[1].tolist() == [0.0, 0.0, 1.0]  # B|C intersect C
+    assert np.allclose(out[2], proba[2]) and labels[2] == ""  # C vs A contradict: left alone
+    assert labels[1] == "f = 1; g = 1"
 
 
 def test_surrogate_tree_exports(loans):

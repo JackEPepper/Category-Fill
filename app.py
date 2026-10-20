@@ -85,15 +85,17 @@ def _assoc(df: pd.DataFrame, target: str, cands: tuple) -> pd.DataFrame:
     return feature_associations(df, target, list(cands))
 
 
-@st.cache_data(show_spinner="Looking for one-to-one values")
+@st.cache_data(show_spinner="Looking for values that limit the category")
 def _value_rules(df: pd.DataFrame, target: str, cands: tuple) -> pd.DataFrame:
     return value_rules(df, target, list(cands))
 
 
 # Results are kept on the server, so re-running the same model after a refresh is instant.
 @st.cache_resource(show_spinner=False, max_entries=6)
-def _train(df: pd.DataFrame, target: str, features: tuple, cfg: TrainConfig, rules: pd.DataFrame):
-    return train_and_fill(df, target, list(features), cfg, value_rules=rules)
+def _train(df: pd.DataFrame, target: str, features: tuple, cfg: TrainConfig, rules: tuple):
+    """``rules`` is a tuple of (feature, value, allowed classes) so it can be part of the cache key."""
+    frame = pd.DataFrame([{"feature": f, "value": v, "classes": list(c)} for f, v, c in rules])
+    return train_and_fill(df, target, list(features), cfg, value_rules=frame)
 
 
 def _surrogate(df: pd.DataFrame, res, depth: int, focus: str | None):
@@ -372,12 +374,14 @@ with tab_feat:
         default=list(assoc.loc[assoc["recommended"], "feature"]),
     )
 
-    st.subheader("Must-use features and one-to-one values")
+    st.subheader("Must-use features and values that limit the category")
     st.markdown(
-        "Some values decide the category on their own, e.g. a yes/no flag where **Y always means one "
-        "category**. These are found automatically below (a value seen on at least 10 labelled loans, with "
-        "97%+ of them in a single category). Ticked rules make their feature **always included**. "
-        "Must-use features can't be dropped by screening, and nearly every tree in the model is allowed to use them."
+        "Some values narrow the answer down on their own, for example a yes/no indicator where **Y always "
+        "means one of a family of categories** (like a BCC indicator that always means one of the BCC "
+        "templates), or exactly one category. These are found automatically below. A value qualifies when "
+        "it is seen on 20+ labelled loans and 98%+ of them fall in a small set of categories. Each ticked "
+        "rule makes its column a **must-use feature**: it can't be dropped by screening, and nearly every "
+        "tree in the model is allowed to use it."
     )
     found = _value_rules(df, target, candidates)
     if len(found):
@@ -388,26 +392,57 @@ with tab_feat:
             disabled=[c for c in found.columns],
             column_config={
                 "use": st.column_config.CheckboxColumn("use", help="Untick to ignore this rule"),
-                "purity": st.column_config.NumberColumn("purity", format="percent"),
+                "classes": st.column_config.ListColumn("allowed categories", width="large"),
+                "n_classes": st.column_config.NumberColumn("# allowed"),
+                "coverage": st.column_config.NumberColumn(
+                    "coverage", format="percent", help="Share of labelled loans with this value that are in the allowed set"
+                ),
                 "value": st.column_config.TextColumn("value"),
             },
             key=f"value_rules_{target}",
         )
         chosen_rules = edited.loc[edited["use"]].drop(columns="use")
     else:
-        st.caption("No one-to-one values found in the selected candidate columns.")
+        st.caption("No limiting values found automatically in the selected candidate columns.")
         chosen_rules = found
+
+    manual_key = f"manual_rules_{target}"
+    manual = st.session_state.setdefault(manual_key, [])
+    with st.expander(f"Add a rule by hand ({len(manual)} added)"):
+        st.caption("For a family you know about, e.g. *bcc_indicator = Y → any of the BCC templates*.")
+        c1, c2 = st.columns(2)
+        m_col = c1.selectbox("Column", list(candidates), index=None, placeholder="Pick a column", key="m_col")
+        m_val = None
+        if m_col is not None:
+            vals = df[m_col].dropna().value_counts().index[:500]
+            m_val = c2.selectbox("Value", list(vals), index=None, placeholder="Pick a value", key=f"m_val_{m_col}")
+        all_classes = sorted(df[target].dropna().astype(str).unique())
+        m_classes = st.multiselect("Allowed categories", all_classes, key="m_classes")
+        if st.button("Add rule", disabled=m_col is None or m_val is None or not m_classes):
+            num = None if is_categorical(df[m_col]) else float(m_val)
+            shown = str(m_val) if num is None else (str(int(num)) if num.is_integer() else f"{num:g}")
+            manual.append({"feature": m_col, "value": shown, "classes": list(m_classes)})
+            st.rerun()
+        for i, r in enumerate(list(manual)):
+            a, b = st.columns([5, 1])
+            a.write(f"**{r['feature']} = {r['value']}** → {' | '.join(r['classes'])}")
+            if b.button("Remove", key=f"m_del_{i}"):
+                manual.pop(i)
+                st.rerun()
+    rule_rows = list(chosen_rules[["feature", "value", "classes"]].to_dict("records")) + manual
+    rules_for_model = tuple((r["feature"], str(r["value"]), tuple(r["classes"])) for r in rule_rows)
+
     required = st.multiselect(
         "Always include these features",
         list(candidates),
-        default=sorted(chosen_rules["feature"].unique()),
+        default=sorted({r[0] for r in rules_for_model}),
         help="Added to the model even if not selected above, and favoured when trees sample columns.",
     )
     apply_rules = st.toggle(
-        "Force the ticked rules onto blank rows",
-        value=False,
-        help="When a blank row has a rule's value, use the rule's category instead of the model's guess. "
-        "The model usually learns these anyway; tab 3 shows whether it agrees with each rule.",
+        "Limit predictions to the categories each ticked rule allows",
+        value=True,
+        help="A loan with a rule's value can only be given one of that rule's allowed categories. The model "
+        "still decides which one. Applies to the test-set readout too, so the accuracy you see is what you get.",
     )
     features = list(dict.fromkeys(features + required))
     cfg = replace(cfg, required_features=tuple(required), apply_value_rules=apply_rules)
@@ -418,7 +453,7 @@ with tab_model:
     if run:
         try:
             with st.spinner("Training XGBoost and scoring the test set"):
-                res = _train(df, target, tuple(features), cfg, chosen_rules.reset_index(drop=True))
+                res = _train(df, target, tuple(features), cfg, rules_for_model)
         except ValueError as e:
             st.error(str(e))
             st.stop()
@@ -445,18 +480,36 @@ with tab_model:
             )
 
         if len(res.rule_check):
-            st.subheader("Does the model follow the one-to-one rules?")
+            st.subheader("Do the rules hold, and does the model respect them?")
             st.dataframe(
                 res.rule_check,
                 hide_index=True,
                 width="stretch",
                 column_config={
-                    "model_agrees_on_test": st.column_config.NumberColumn(format="percent"),
-                    "model_agrees_on_blank": st.column_config.NumberColumn(format="percent"),
+                    "actual_in_allowed": st.column_config.NumberColumn(
+                        "actual in allowed (test)", format="percent", help="How well the rule itself holds on held-out loans"
+                    ),
+                    "model_in_allowed_test": st.column_config.NumberColumn(
+                        "model in allowed (test)", format="percent", help="Before limiting: the model on its own"
+                    ),
+                    "model_in_allowed_blank": st.column_config.NumberColumn(
+                        "model in allowed (blank rows)", format="percent", help="Before limiting: the model on its own"
+                    ),
                 },
             )
+            weak = res.rule_check[res.rule_check["actual_in_allowed"] < 0.95]
+            if len(weak):
+                st.warning(
+                    "These rules don't hold on held-out loans (under 95% of actual categories are in the allowed "
+                    "set). Untick or remove them in tab 2: "
+                    + "; ".join(f"**{r.rule}** ({r.actual_in_allowed:.0%})" for r in weak.itertuples())
+                )
             if res.config.apply_value_rules:
-                st.caption("Rules are being forced onto matching blank rows (see the set_by column in tab 4).")
+                st.caption(
+                    f"Predictions are limited to each rule's allowed categories. Test accuracy with limits "
+                    f"{m['accuracy']:.1%}, without {m['accuracy_without_rules']:.1%}. In tab 4, `set_by` shows "
+                    "where a rule changed the model's pick and `rules_applied` lists the rules on each row."
+                )
 
         st.subheader("How much to trust each prediction")
         left, right = st.columns(2)

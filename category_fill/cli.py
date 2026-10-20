@@ -51,7 +51,8 @@ def main(argv=None):
     ap.add_argument(
         "--apply-value-rules",
         action="store_true",
-        help="force detected one-to-one values (e.g. flag=Y always means one class) onto blank rows",
+        help="limit predictions to the classes each detected value rule allows "
+        "(e.g. bcc_indicator=Y -> one of the BCC templates); also makes those columns required",
     )
     ap.add_argument("--tree-depth", type=int, default=4, help="levels in the exported explanation tree")
     ap.add_argument("--min-confidence", type=float, default=0.0, help="leave predictions below this blank")
@@ -89,7 +90,8 @@ def main(argv=None):
 
     rules = value_rules(df, target, candidates)
     if len(rules):
-        print("\nOne-to-one values found (value -> always this class):\n" + rules.to_string(index=False))
+        shown = rules.assign(classes=rules["classes"].map(" | ".join))
+        print("\nValues that limit the category (value -> one of these classes):\n" + shown.to_string(index=False))
     features = args.features or list(assoc.loc[assoc["recommended"], "feature"])
     required = list(dict.fromkeys(args.require + (list(rules["feature"].unique()) if args.apply_value_rules else [])))
     cfg = TrainConfig(
@@ -101,7 +103,13 @@ def main(argv=None):
     )
     result = train_and_fill(df, target, features, cfg, progress=lambda m: print(f"... {m}"), value_rules=rules)
     if len(result.rule_check):
-        print("\nDoes the model follow them?\n" + result.rule_check.to_string(index=False))
+        print("\nDo the rules hold, and does the model respect them?\n" + result.rule_check.to_string(index=False))
+        weak = result.rule_check[result.rule_check["actual_in_allowed"] < 0.95]
+        if len(weak):
+            print("WARNING: these rules hold on under 95% of held-out loans: " + "; ".join(weak["rule"]))
+        if args.apply_value_rules:
+            m = result.metrics
+            print(f"Test accuracy with rule limits {m['accuracy']:.1%}, without {m['accuracy_without_rules']:.1%}")
 
     print("\n" + summary_frame(result).to_string(index=False))
     print("\nPer class (test set):\n" + result.per_class.to_string())
