@@ -126,7 +126,8 @@ def main(argv=None):
     filled = fill_frame(raw, result, args.min_confidence, in_population=in_pop)
     filled.to_csv(out / "filled_data.csv", index=False)
     result.predictions.to_csv(out / "blank_row_predictions.csv", index=False)
-    (out / "report.xlsx").write_bytes(report_workbook(result, filled, assoc, curve, rule_table))
+    # The filled data is already in filled_data.csv; leaving it out keeps the workbook small and quick.
+    (out / "report.xlsx").write_bytes(report_workbook(result, None, assoc, curve, rule_table))
 
     import matplotlib.pyplot as plt
 

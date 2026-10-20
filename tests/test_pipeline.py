@@ -247,3 +247,22 @@ def test_surrogate_tree_exports(loans):
     assert b"<svg" in explain.figure_bytes(fig, "svg")
     assert explain.figure_bytes(fig, "pdf")[:4] == b"%PDF"
     assert "THEN" in explain.rules_text(focused) and len(explain.rules_frame(focused)) == focused.tree.get_n_leaves()
+
+
+def test_value_rules_ignore_chance_patterns():
+    """A noise column with many small groups (like US states) must not produce rules."""
+    from category_fill.analysis import value_rules
+
+    rng = np.random.default_rng(5)
+    n = 8000
+    classes = [f"T{i}" for i in range(60)]
+    y = pd.Series(rng.choice(classes, n), dtype="string")
+    sizes = 1 / np.arange(1, 51) ** 1.3
+    state = pd.Series(rng.choice([f"S{i}" for i in range(50)], n, p=sizes / sizes.sum()), dtype="string")
+    fam = y.isin(classes[:5])
+    flag = pd.Series(np.where(fam & (rng.random(n) < 0.8), "Y", "N"), dtype="string")
+    df = pd.DataFrame({"state": state, "flag": flag, "y": y})
+    rules = value_rules(df, "y", ["state", "flag"], max_levels=1000)  # even when every column is searched
+    assert set(rules["feature"]) == {"flag"}
+    row = rules.iloc[0]
+    assert row["value"] == "Y" and row["classes"] == classes[:5] and row["recommended"]

@@ -126,8 +126,8 @@ def feature_associations(df: pd.DataFrame, target: str, features: list[str] | No
             flags.append("blank where target is blank")
         if assoc >= 0.95:
             flags.append("near-deterministic (check for leakage)")
-        if assoc < 0.02 and not flags:
-            flags.append("no detectable signal")
+        if assoc < 0.05 and not flags:
+            flags.append("weak or no signal")
 
         hard = {
             "constant",
@@ -135,7 +135,7 @@ def feature_associations(df: pd.DataFrame, target: str, features: list[str] | No
             "possible ID",
             "mostly blank",
             "blank where target is blank",
-            "no detectable signal",
+            "weak or no signal",
         }
         rows.append(
             {
@@ -176,49 +176,72 @@ def class_distribution(df: pd.DataFrame, target: str) -> pd.DataFrame:
     )
 
 
+def _allowed_set(counts: pd.Series, min_coverage: float) -> list[str]:
+    """Smallest group of classes (most common first) covering ``min_coverage`` of ``counts``."""
+    counts = counts[counts > 0].sort_values(ascending=False)
+    k = int((counts.cumsum() / counts.sum() < min_coverage).sum()) + 1
+    return list(map(str, counts.index[:k]))
+
+
 def value_rules(
     df: pd.DataFrame,
     target: str,
     features: list[str],
-    min_rows: int = 20,
+    min_rows: int = 30,
     min_coverage: float = 0.98,
+    min_holdout_coverage: float = 0.97,
     max_share_of_classes: float = 0.5,
-    min_expected_outside: float = 5.0,
-    max_levels: int = 50,
+    max_book_share: float = 0.5,
+    min_rows_per_class: float = 10.0,
+    max_levels: int = 10,
+    flag_levels: int = 3,
+    seed: int = 0,
 ) -> pd.DataFrame:
     """Find values that limit the target to a small set of classes.
 
     'Whenever <feature> is <value>, the target is one of <classes>'. A one-to-one rule is the case of a
     single class. For example, ``bcc_indicator = Y`` might always mean one of the BCC risk-rating
-    templates, without saying which one.
+    templates, without saying which.
 
-    For each value seen on at least ``min_rows`` labelled loans, the allowed set is the smallest group of
-    classes covering ``min_coverage`` of those loans. It is reported only if:
-      * it is at most ``max_share_of_classes`` of all classes (otherwise it rules out little), and
-      * at least ``min_expected_outside`` loans would have fallen outside the set if the value were
-        unrelated to the target, so the gap is unlikely to be chance.
-    Numeric columns are considered only if they have <= 10 distinct values.
+    Deliberately strict, so chance patterns (e.g. a small state that happens to contain few templates)
+    are not reported:
+      * only flag-like columns with at most ``max_levels`` distinct values are searched;
+      * the value must be on ``min_rows`` labelled loans, with at least ``min_rows_per_class`` loans
+        per allowed class on average;
+      * it must narrow things down: at most ``max_share_of_classes`` of the classes, which together
+        make up at most ``max_book_share`` of all labelled loans;
+      * holdout check: the allowed set is built on a random half of the loans and must still cover
+        ``min_holdout_coverage`` of the other half. A real rule passes; a coincidence doesn't.
+    Rules from columns with at most ``flag_levels`` values (yes/no indicators) are marked
+    ``recommended``; others are shown but not pre-selected.
     """
     labelled = df.loc[df[target].notna()]
     y = target_labels(labelled[target]).astype(str)
-    overall = y.value_counts(normalize=True)
-    max_allowed = max(1, int(len(overall) * max_share_of_classes))
+    n_classes_total = y.nunique()
+    max_allowed = max(1, int(n_classes_total * max_share_of_classes))
+    book_share = y.value_counts(normalize=True)
+    half = np.random.default_rng(seed).random(len(labelled)) < 0.5
     blank = df.loc[df[target].isna()]
     rows = []
     for col in features:
         s = labelled[col]
-        if col == target or s.nunique() > (max_levels if is_categorical(s) else 10):
+        n_levels = s.nunique()
+        if col == target or n_levels > max_levels:
             continue
         tab = pd.crosstab(s, y)
+        tab_a = pd.crosstab(s[half], y[half]).reindex(index=tab.index, columns=tab.columns, fill_value=0)
+        tab_b = tab - tab_a
         for value, counts in tab.iterrows():
             n = int(counts.sum())
-            if n < min_rows:
+            if n < min_rows or tab_a.loc[value].sum() == 0 or tab_b.loc[value].sum() == 0:
                 continue
-            counts = counts[counts > 0].sort_values(ascending=False)
-            k = int((counts.cumsum() / n < min_coverage).sum()) + 1
-            allowed = sorted(map(str, counts.index[:k]))
-            expected_outside = n * (1 - overall[allowed].sum())
-            if k > max_allowed or expected_outside < min_expected_outside:
+            allowed = _allowed_set(counts, min_coverage)
+            k = len(allowed)
+            if k > max_allowed or n / k < min_rows_per_class or book_share[allowed].sum() > max_book_share:
+                continue
+            from_a = _allowed_set(tab_a.loc[value], min_coverage)
+            holdout = float(tab_b.loc[value, from_a].sum() / tab_b.loc[value].sum())
+            if holdout < min_holdout_coverage:
                 continue
             # Always text, so the table never mixes types ("Y" next to 1); matching converts back as needed.
             shown = str(value)
@@ -228,13 +251,20 @@ def value_rules(
                 {
                     "feature": col,
                     "value": shown,
-                    "classes": allowed,
+                    "classes": sorted(allowed),
                     "n_classes": k,
                     "labelled_rows": n,
-                    "coverage": round(float(counts.iloc[:k].sum() / n), 4),
+                    "coverage": round(float(counts[allowed].sum() / n), 4),
+                    "holdout_coverage": round(holdout, 4),
                     "blank_rows_with_value": int((blank[col] == value).sum()),
+                    "recommended": bool(n_levels <= flag_levels),
                 }
             )
-    cols = ["feature", "value", "classes", "n_classes", "labelled_rows", "coverage", "blank_rows_with_value"]
+    cols = [
+        "feature", "value", "classes", "n_classes", "labelled_rows", "coverage", "holdout_coverage",
+        "blank_rows_with_value", "recommended",
+    ]
     out = pd.DataFrame(rows, columns=cols)
-    return out.sort_values(["n_classes", "labelled_rows"], ascending=[True, False]).reset_index(drop=True)
+    return out.sort_values(["recommended", "n_classes", "labelled_rows"], ascending=[False, True, False]).reset_index(
+        drop=True
+    )
