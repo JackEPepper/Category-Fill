@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import io
 import re
 import warnings
@@ -33,8 +34,45 @@ def load_table(source, filename: str | None = None) -> pd.DataFrame:
     else:
         # Default: CSV. Read everything as text so cleaning decides types consistently.
         df = pd.read_csv(source, dtype=str, keep_default_na=False, encoding_errors="replace")
-    df.columns = [str(c).strip() for c in df.columns]
+    df.columns = _unique_names(df.columns)
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = _uniform_object_column(df[col])
     return df
+
+
+def _unique_names(columns) -> list[str]:
+    """Strip header whitespace and make duplicates unique ('Type', 'Type_2') so every column is addressable."""
+    seen: dict[str, int] = {}
+    out = []
+    for c in columns:
+        name = str(c).strip() or "unnamed"
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}_{seen[name]}"
+        seen.setdefault(name, 1)
+        out.append(name)
+    return out
+
+
+def _cell_text(v) -> str:
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))  # Excel stores 101 as 101.0
+    if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date)):
+        return v.isoformat()
+    return str(v)
+
+
+def _uniform_object_column(s: pd.Series) -> pd.Series:
+    """Excel columns can hold numbers and text in the same column (e.g. 101 and 'ABL - General').
+
+    Mixed columns break Arrow-based tools (Streamlit tables, Parquet), so render every non-blank
+    cell as text. Columns that hold a single Python type are left alone.
+    """
+    nonnull = s.dropna()
+    if nonnull.map(type).nunique() <= 1:
+        return s
+    return s.map(_cell_text, na_action="ignore").astype(object)
 
 
 def _to_text(s: pd.Series) -> pd.Series:
