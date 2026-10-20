@@ -147,3 +147,26 @@ def test_rule_blank_numeric_values_and_cli_parse():
     assert r.values == ["SBA 7(a)", "Term Loan"]
     with pytest.raises(ValueError):
         cf.population_mask(df, [cf.Rule("nope", ["a"])])
+
+
+def test_excel_mixed_type_columns(tmp_path):
+    import pyarrow as pa
+
+    raw = pd.DataFrame(
+        {
+            "product": [101, 102, "ABL - General", 101, None],
+            "amount": [1.0, 2.5, 3.0, 4.0, 5.0],
+            "when": [pd.Timestamp("2024-01-31"), "2024-02-01", None, "2024-03-01", "2024-04-01"],
+            "dup": ["a", "b", "c", "d", "e"],
+            "dup ": ["v", "w", "x", "y", "z"],
+        }
+    )
+    path = tmp_path / "mixed.xlsx"
+    raw.to_excel(path, index=False)
+    df = cf.load_table(path)
+    assert list(df.columns) == ["product", "amount", "when", "dup", "dup_2"]
+    assert df["product"].dropna().tolist() == ["101", "102", "ABL - General", "101"]
+    assert df["amount"].dtype == "float64"
+    pa.Table.from_pandas(df)  # used to raise ArrowInvalid: could not convert 'ABL - General' ... to int64
+    cleaned = cf.clean_frame(df)
+    assert cleaned["product"].dtype == "string" and cleaned["product"].isna().sum() == 1
