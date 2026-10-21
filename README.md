@@ -20,13 +20,19 @@ The first run installs dependencies into `.venv` (about a minute). After that, a
 3. **Column to fill** is picked for you: the category column whose missing share is closest to 15%. Change it if it's wrong.
 4. **Tab 1 · Data** shows each column's type, how much is blank, how many distinct values it has, and the target's class mix.
 5. **Tab 2 · Features** shows how strongly each column is associated with the target, and flags columns to leave out
-   (IDs, constants, no signal, or blank on the same rows as the target). The recommended set is
-   pre-selected; edit it as you like.
+   (IDs, constants, weak or no signal, or blank on the same rows as the target). The recommended set is
+   pre-selected. Use **Recommended / Top 5 only / All / None** to change the selection in one click.
    - **Values that limit the category** are found automatically. A value narrows the answer to one
      category or a *family* of categories, e.g. `bcc_indicator = Y` always means one of the BCC
-     risk-rating templates, without saying which. A value qualifies when it's seen on 20+ labelled
-     loans, 98%+ of them fall in a set of at most half the categories, and the gap is too big to be
-     chance. You can also **add a rule by hand** (column, value, allowed categories).
+     risk-rating templates, without saying which. Detection is deliberately strict, so things like
+     individual states don't turn into rules:
+     - only columns with at most 10 distinct values are searched;
+     - a value needs 30+ labelled loans, 98%+ of them in a small set of categories (≥10 loans per
+       allowed category, ≤ half the book);
+     - the set is built on one half of the loans and must still hold on the other half.
+   - Only rules from **yes/no flag** columns (≤3 values) start ticked. **Tick yes/no flags only / Tick
+     all / Untick all** change every tick at once. You can also **add a rule by hand** (column,
+     value, allowed categories).
    - Each ticked rule makes its column a **must-use feature**. Must-use features can't be dropped by
      screening, and nearly every tree in the model is allowed to use them. You can also add any other
      column under "Always include these features".
@@ -41,9 +47,10 @@ The first run installs dependencies into `.venv` (about a minute). After that, a
    - precision, recall and F1 for each category, and a confusion matrix
    - which columns matter (the accuracy lost when each column is shuffled), plus an optional test
      that finds the smallest set of columns that does the job
-7. **Tab 4 · Filled data:** set a minimum confidence, then download the filled file as CSV, the
-   predictions as CSV, or a full Excel report.
-8. **Tab 5 · Explain** draws a decision tree you can show to people, downloadable as PNG, SVG or
+7. **Tab 4 · Filled data:** set a minimum confidence and pick which of your columns to show next to
+   the predictions. Then download the filled file as CSV, the predictions as CSV, or the Excel report
+   (metrics and predictions; the full filled data is in the CSV).
+8. **Tab 5 · Explain** (switch on **Draw the tree**) draws a decision tree you can show to people, downloadable as PNG, SVG or
    PDF, plus the same logic as plain IF/THEN rules (.txt).
    - The real model is hundreds of trees, so this is a single tree trained to give the same answers.
      **Agreement** shows how faithful the picture is, next to what "always give the most common
@@ -61,6 +68,18 @@ The filled file is your original data plus these columns:
 | `<target>_2nd_choice` | runner-up class |
 
 The predictions file has `set_by` (`model`, or `model, changed by rule` where a rule changed the model's pick) and `rules_applied` (the rules matching that row).
+
+**Running on AWS SageMaker (or behind any proxy):**
+- **Opening it:** start the app in a terminal on the instance with `./run_app.sh`. Open it at
+  `https://<your-instance>/proxy/8501/`. In Studio JupyterLab, use
+  `https://<studio-domain>/jupyterlab/default/proxy/8501/`.
+- **If uploads fail with a 403:** start it with
+  `streamlit run app.py --server.enableCORS false --server.enableXsrfProtection false`.
+- **Message size limit:** that proxy (jupyter-server-proxy) drops the connection when one message
+  from the app is over 10 MiB, which shows up as a blank white page. The app keeps every on-screen
+  table under ~2 MB. In tab 4 you pick which of your columns to show, and downloads contain
+  everything. Download files and the explanation tree are only built when you ask for them.
+  `.streamlit/config.toml` also turns on websocket compression and a 20-second keep-alive ping.
 
 **Sessions and refreshes:**
 - A session (uploaded file, settings, trained model) is kept for 24 hours after the browser tab

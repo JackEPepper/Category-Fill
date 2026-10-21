@@ -106,6 +106,25 @@ def _surrogate(df: pd.DataFrame, res, depth: int, focus: str | None):
     return cache[key]
 
 
+# Every table is sent to the browser as one websocket message. Proxies cap message size (SageMaker's
+# Jupyter proxy drops the connection above 10 MiB, which shows up as a blank page), so on-screen tables
+# are capped well below that. Downloads always contain everything.
+MAX_TABLE_BYTES = 2_000_000
+
+
+def show_table(frame: pd.DataFrame, **kwargs) -> None:
+    size = int(frame.memory_usage(deep=True, index=False).sum())
+    if size > MAX_TABLE_BYTES and len(frame) > 1:
+        keep = max(1, int(len(frame) * MAX_TABLE_BYTES / size))
+        st.caption(f"Showing the first {keep:,} of {len(frame):,} rows to keep the page light; downloads have all rows.")
+        frame = frame.head(keep)
+    st.dataframe(frame, **kwargs)
+
+
+def set_state(key: str, value) -> None:
+    st.session_state[key] = value
+
+
 def hbar(frame: pd.DataFrame, x: str, y: str, title: str, fmt: str = ".2f"):
     fig = px.bar(frame, x=x, y=y, orientation="h", title=title, text_auto=fmt)
     fig.update_traces(marker_color=BAR, marker_line_width=0, textposition="outside", cliponaxis=False)
@@ -226,7 +245,7 @@ def population_editor(frame: pd.DataFrame) -> list[Rule]:
         c1.metric("Loans in population", f"{int(keep.sum()):,}", f"of {len(frame):,}", delta_color="off", delta_arrow="off")
         c2.metric("Loans excluded", f"{int((~keep).sum()):,}")
         st.dataframe(rules_summary(frame, active), hide_index=True, width="stretch")
-        st.download_button("Save these rules (.json)", rules_to_json(active), "population_rules.json", "application/json")
+        st.download_button("Save these rules (.json)", rules_to_json(active), "population_rules.json", "application/json", on_click="ignore")
     return active
 
 
@@ -333,7 +352,7 @@ with tab_data:
         st.subheader(f"'{target}' distribution (labelled rows)")
         st.plotly_chart(hbar(dist, "count", "class", "", ",d"), width="stretch")
     with st.expander("Raw data preview"):
-        st.dataframe(raw.head(200), width="stretch")
+        show_table(raw.head(200), width="stretch")
 
 # ---------------------------------------------------------------- 2. features
 with tab_feat:
@@ -368,29 +387,61 @@ with tab_feat:
         st.dataframe(shift, hide_index=True, width="stretch")
 
     st.subheader("Features to train on")
+    recommended = list(assoc.loc[assoc["recommended"], "feature"])
+    fkey = f"features_{target}"
+    if fkey not in st.session_state:
+        st.session_state[fkey] = recommended
+    st.session_state[fkey] = [f for f in st.session_state[fkey] if f in candidates]
+    b1, b2, b3, b4, _ = st.columns([1.3, 1.3, 1, 1, 3])
+    b1.button("Recommended", on_click=set_state, args=(fkey, recommended), key="f_rec", width="stretch")
+    b2.button("Top 5 only", on_click=set_state, args=(fkey, recommended[:5]), key="f_top", width="stretch")
+    b3.button("All", on_click=set_state, args=(fkey, list(candidates)), key="f_all", width="stretch")
+    b4.button("None", on_click=set_state, args=(fkey, []), key="f_none", width="stretch")
     features = st.multiselect(
-        "Selected features (pre-filled with the recommended set)",
+        f"Selected features ({len(st.session_state[fkey])} of {len(candidates)})",
         list(candidates),
-        default=list(assoc.loc[assoc["recommended"], "feature"]),
+        key=fkey,
     )
 
     st.subheader("Must-use features and values that limit the category")
     st.markdown(
         "Some values narrow the answer down on their own, for example a yes/no indicator where **Y always "
         "means one of a family of categories** (like a BCC indicator that always means one of the BCC "
-        "templates), or exactly one category. These are found automatically below. A value qualifies when "
-        "it is seen on 20+ labelled loans and 98%+ of them fall in a small set of categories. Each ticked "
+        "templates), or exactly one category. These are found automatically below, from columns with at most "
+        "10 distinct values. A value qualifies when it is on 30+ labelled loans, 98%+ of them fall in a small "
+        "set of categories, and that still holds when checked on a separate half of the loans, so chance "
+        "patterns are left out. Only rules from **yes/no flag** columns are ticked to start with. Each ticked "
         "rule makes its column a **must-use feature**: it can't be dropped by screening, and nearly every "
         "tree in the model is allowed to use it."
     )
     found = _value_rules(df, target, candidates)
     if len(found):
+        tkey, vkey = f"rule_ticks_{target}", f"rule_ver_{target}"
+        ids = list(zip(found["feature"], found["value"]))
+        ticks = st.session_state.setdefault(tkey, {})  # (column, value) -> ticked; new rules start as recommended
+        use = [ticks.get(i, bool(rec)) for i, rec in zip(ids, found["recommended"])]
+        st.session_state.setdefault(vkey, 0)
+
+        def _set_ticks(values):
+            st.session_state[tkey] = dict(zip(ids, map(bool, values)))
+            st.session_state[vkey] += 1  # fresh editor so the new ticks show
+
+        b1, b2, b3, _ = st.columns([1.6, 1, 1, 3.4])
+        b1.button("Tick yes/no flags only", on_click=_set_ticks, args=(found["recommended"],), key="r_rec", width="stretch")
+        b2.button("Tick all", on_click=_set_ticks, args=([True] * len(found),), key="r_all", width="stretch")
+        b3.button("Untick all", on_click=_set_ticks, args=([False] * len(found),), key="r_none", width="stretch")
         edited = st.data_editor(
-            found.assign(use=True),
+            found.assign(use=use),
             hide_index=True,
             width="stretch",
             disabled=[c for c in found.columns],
             column_config={
+                "recommended": st.column_config.CheckboxColumn(
+                    "yes/no flag", help="From a column with at most 3 values. Only these are ticked by default."
+                ),
+                "holdout_coverage": st.column_config.NumberColumn(
+                    "holdout check", format="percent", help="Built on half the loans, checked on the other half"
+                ),
                 "use": st.column_config.CheckboxColumn("use", help="Untick to ignore this rule"),
                 "classes": st.column_config.ListColumn("allowed categories", width="large"),
                 "n_classes": st.column_config.NumberColumn("# allowed"),
@@ -399,8 +450,9 @@ with tab_feat:
                 ),
                 "value": st.column_config.TextColumn("value"),
             },
-            key=f"value_rules_{target}",
+            key=f"value_rules_{target}_{st.session_state[vkey]}",
         )
+        ticks.update(zip(ids, map(bool, edited["use"])))
         chosen_rules = edited.loc[edited["use"]].drop(columns="use")
     else:
         st.caption("No limiting values found automatically in the selected candidate columns.")
@@ -581,7 +633,7 @@ with tab_model:
         with st.expander("Test-set predictions (row-level)"):
             only_wrong = st.checkbox("Only show mistakes")
             tp = res.test_predictions
-            st.dataframe(tp[~tp["correct"]] if only_wrong else tp, hide_index=True, width="stretch")
+            show_table(tp[~tp["correct"]] if only_wrong else tp, hide_index=True, width="stretch")
 
 # ---------------------------------------------------------------- 4. predictions
 with tab_pred:
@@ -594,31 +646,40 @@ with tab_pred:
             0.0, 0.99, 0.0, 0.05,
             help="Rows below the cut-off stay blank and are marked 'blank (low confidence)'.",
         )
-        filled = fill_frame(raw, res, min_conf, in_population=in_pop)
-        accepted = int((filled[f"{target}_source"] == "predicted").sum())
-        st.metric("Rows filled", f"{accepted:,} of {len(res.predictions):,}")
+        shown_preds = res.predictions[res.predictions["confidence"] >= min_conf]
+        st.metric("Rows filled", f"{len(shown_preds):,} of {len(res.predictions):,}")
 
-        preds = res.predictions.merge(raw, left_on="row", right_index=True, how="left")
-        st.dataframe(preds[preds["confidence"] >= min_conf], hide_index=True, width="stretch")
+        extra = st.multiselect(
+            "Also show these columns from your data",
+            list(raw.columns),
+            default=list(raw.columns[:1]),
+            help="The downloads always include every column.",
+        )
+        show_table(shown_preds.merge(raw[extra], left_on="row", right_index=True, how="left"), hide_index=True, width="stretch")
 
-        pred_dist = res.predictions.loc[res.predictions["confidence"] >= min_conf, "predicted"].value_counts().reset_index()
+        pred_dist = shown_preds["predicted"].value_counts().reset_index()
         pred_dist.columns = ["class", "count"]
         st.plotly_chart(hbar(pred_dist, "count", "class", "Predicted categories for blank rows", ",d"), width="stretch")
 
+        # Files are built only when a button is clicked, not on every rerun.
+        def _filled_csv():
+            return fill_frame(raw, res, min_conf, in_population=in_pop).to_csv(index=False).encode()
+
+        def _preds_csv():
+            return res.predictions.merge(raw, left_on="row", right_index=True, how="left").to_csv(index=False).encode()
+
+        def _report():  # metrics and predictions; the full filled data is the CSV next to it (much faster)
+            return report_workbook(res, None, assoc, st.session_state.get("curve"), rules_summary(df_all, rules))
+
         c1, c2, c3 = st.columns(3)
-        c1.download_button(
-            "Download filled data (CSV)", filled.to_csv(index=False).encode(), f"{source_name}_filled.csv", "text/csv"
-        )
-        c2.download_button(
-            "Download predictions only (CSV)",
-            preds.to_csv(index=False).encode(),
-            f"{source_name}_predictions.csv",
-            "text/csv",
-        )
+        c1.download_button("Download filled data (CSV)", _filled_csv, f"{source_name}_filled.csv", "text/csv", on_click="ignore")
+        c2.download_button("Download predictions only (CSV)", _preds_csv, f"{source_name}_predictions.csv", "text/csv", on_click="ignore")
         c3.download_button(
             "Download full report (Excel)",
-            report_workbook(res, filled, assoc, st.session_state.get("curve"), rules_summary(df_all, rules)),
+            _report,
             f"{source_name}_report.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            on_click="ignore",
         )
         with st.expander("Summary"):
             st.dataframe(summary_frame(res), hide_index=True, width="stretch")
@@ -641,6 +702,8 @@ with tab_explain:
         choice = c1.selectbox("Explain", by_size + [ALL], help="One category vs. the rest gives the clearest, most faithful tree.")
         focus = None if choice == ALL else choice
         tree_depth = c2.slider("Levels of questions", 2, 6, 4 if focus is None else 3)
+        if not st.toggle("Draw the tree", key="draw_tree", help="Built only when switched on, to keep the app fast."):
+            st.stop()
         with st.spinner("Fitting explanation tree"):
             sur = _surrogate(df, res, tree_depth, focus)
         m1, m2, m3 = st.columns(3)
@@ -673,11 +736,19 @@ with tab_explain:
         stem = f"{source_name}_{target}_tree" + (f"_{focus}" if focus else "") + f"_depth{tree_depth}"
         stem = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in stem)
         d1, d2, d3, d4 = st.columns(4)
-        d1.download_button("Download PNG", explain.figure_bytes(fig, "png"), f"{stem}.png", "image/png")
-        d2.download_button("Download SVG", explain.figure_bytes(fig, "svg"), f"{stem}.svg", "image/svg+xml")
-        d3.download_button("Download PDF", explain.figure_bytes(fig, "pdf"), f"{stem}.pdf", "application/pdf")
-        d4.download_button("Download rules (.txt)", explain.rules_text(sur), f"{stem}_rules.txt", "text/plain")
         plt.close(fig)
+
+        def _tree_file(fmt: str, surrogate=sur):
+            f = explain.tree_figure(surrogate)
+            try:
+                return explain.figure_bytes(f, fmt)
+            finally:
+                plt.close(f)
+
+        d1.download_button("Download PNG", lambda: _tree_file("png"), f"{stem}.png", "image/png", on_click="ignore")
+        d2.download_button("Download SVG", lambda: _tree_file("svg"), f"{stem}.svg", "image/svg+xml", on_click="ignore")
+        d3.download_button("Download PDF", lambda: _tree_file("pdf"), f"{stem}.pdf", "application/pdf", on_click="ignore")
+        d4.download_button("Download rules (.txt)", explain.rules_text(sur), f"{stem}_rules.txt", "text/plain", on_click="ignore")
         st.subheader("The same tree as IF/THEN rules")
         st.dataframe(
             explain.rules_frame(sur),
